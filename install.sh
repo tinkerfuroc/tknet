@@ -2,7 +2,21 @@
 set -eu
 
 main() {
-    version=v0.3.3
+    version=v0.4.0
+    role=client
+    if [ -f /opt/tknet/role ]; then
+        role=$(cat /opt/tknet/role)
+    fi
+    case "$#:$*" in
+        0:) ;;
+        1:--server) role=server ;;
+        1:--client) role=client ;;
+        *) printf '%s\n' 'Usage: install.sh [--client|--server]' >&2; exit 1 ;;
+    esac
+    case "$role" in
+        client|server) ;;
+        *) printf '%s\n' 'Invalid installed role; specify --client or --server.' >&2; exit 1 ;;
+    esac
     nebula_version=v1.12.0
     asset="https://raw.githubusercontent.com/tinkerfuroc/tknet/$version/tknet.py"
 
@@ -47,16 +61,27 @@ main() {
 
     curl --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 --retry 2 -fsSL "$asset" -o "$temporary_dir/tknet"
     /usr/bin/python3 -Es "$temporary_dir/tknet" --help >/dev/null
-    curl --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 --retry 2 -fsSL \
-        "https://raw.githubusercontent.com/tinkerfuroc/tknet/$version/admin.py" \
-        -o "$temporary_dir/admin.py"
+    if [ "$role" = server ]; then
+        curl --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 --retry 2 -fsSL \
+            "https://raw.githubusercontent.com/tinkerfuroc/tknet/$version/admin.py" \
+            -o "$temporary_dir/admin.py"
+    fi
     sudo install -d -m 755 /opt/tknet/lib
     sudo install -m 644 "$temporary_dir/tknet" /opt/tknet/lib/tknet.py
-    sudo install -m 644 "$temporary_dir/admin.py" /opt/tknet/lib/admin.py
+    if [ "$role" = server ]; then
+        sudo install -m 644 "$temporary_dir/admin.py" /opt/tknet/lib/admin.py
+    else
+        sudo rm -f /opt/tknet/lib/admin.py
+    fi
+    printf '%s\n' "$role" > "$temporary_dir/role"
+    sudo install -m 644 "$temporary_dir/role" /opt/tknet/role
+    if sudo test -f /etc/tknet/sshd_config; then
+        sudo /usr/bin/python3 -Es /opt/tknet/lib/tknet.py install-helpers
+    fi
     chmod 755 "$temporary_dir/tknet"
     mv -fT -- "$temporary_dir/tknet" "$install_dir/tknet"
 
-    printf 'Installed tknet %s at %s\n' "$version" "$install_dir/tknet"
+    printf 'Installed tknet %s (%s) at %s\n' "$version" "$role" "$install_dir/tknet"
     case ":$PATH:" in
         *":$install_dir:"*) printf '%s\n' 'Run tknet up to connect. No system service is installed.' ;;
         *) printf '%s\n' "Add $install_dir to PATH, or run $install_dir/tknet up." ;;

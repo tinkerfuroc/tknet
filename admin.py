@@ -9,10 +9,11 @@ import os
 from pathlib import Path
 import secrets
 import sys
+import subprocess
 import tempfile
 import time
 
-from tknet import BIN, ENROLLMENT_HOST_KEY, HOSTS, invitation_key, run, valid_name, write
+from tknet import BIN, ENROLLMENT_HOST_KEY, HOSTS, SYSTEM_PYTHON, certificate_info, invitation_key, run, valid_name, write
 
 ADMIN = Path.home() / ".local/share/tknet/admin"
 SERVER_HOST_KEY_FILE = Path("/etc/ssh/ssh_host_ed25519_key.pub")
@@ -59,6 +60,11 @@ def issue_host(name, request):
         run(["ssh-keygen", "-q", "-s", ADMIN / "ssh-host-ca", "-I", name, "-h", "-n",
              f"{name},{HOSTS[name]}", "-V", "-5m:+52w", directory / "host.pub"])
         bundle["ssh-host-cert.pub"] = (directory / "host-cert.pub").read_text()
+        bundle["refresh_token"] = "host-" + name
+        write(ADMIN / "hosts" / (name + "-request.json"), json.dumps(request))
+        write(ADMIN / "hosts" / (name + ".json"), json.dumps(bundle))
+        remember_certificate(name, bundle)
+        authorize_refresh(bundle["refresh_token"], request["ssh_public"])
         return bundle
 
 
@@ -97,12 +103,20 @@ def invite(name):
 
 
 def enroll(token, request):
+    with (ADMIN / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return enroll_locked(token, request)
+
+
+def enroll_locked(token, request):
     if len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
         raise ValueError("Invalid invitation")
     directory = ADMIN / "invitations" / token
     with (directory / "lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         record = json.loads((directory / "record.json").read_text())
+        if record.get("revoked"):
+            raise ValueError("Device revoked")
         if record["expires"] < time.time():
             raise ValueError("Invitation expired")
         saved = directory / "request.json"
@@ -114,8 +128,167 @@ def enroll(token, request):
         write(saved, json.dumps(request))
         with tempfile.TemporaryDirectory(dir=directory) as temp:
             response = sign(record["name"], record["address"], "guest", request, Path(temp))
+        response["refresh_token"] = token
         write(directory / "response.json", json.dumps(response))
+        remember_certificate(record["name"], response)
+        authorize_refresh(token, request["ssh_public"])
         return response
+
+
+def remember_certificate(name, bundle):
+    path = ADMIN / "history" / (name + ".json")
+    history = json.loads(path.read_text()) if path.exists() else []
+    fingerprint = certificate_info(bundle["node.crt"])["fingerprint"]
+    if fingerprint not in history:
+        history.append(fingerprint)
+    write(path, json.dumps(history))
+
+
+def authorize_refresh(token, public_key):
+    authority = Path(__file__).resolve()
+    line = f'restrict,command="/usr/bin/python3 -Es {authority} refresh {token}" {public_key.strip()}\n'
+    authorized = Path.home() / ".ssh/authorized_keys"
+    previous = authorized.read_text() if authorized.exists() else ""
+    if line not in previous:
+        write(authorized, previous.rstrip("\n") + "\n" + line)
+
+
+def policy_snapshot():
+    path = ADMIN / "policy.json"
+    return json.loads(path.read_text()) if path.exists() else {"version": 0, "fingerprints": [], "ssh_keys": [], "revoked_names": []}
+
+
+def member_files(name):
+    valid_name(name)
+    if name in HOSTS:
+        bundle = ADMIN / "hosts" / (name + ".json")
+        request = ADMIN / "hosts" / (name + "-request.json")
+        if not bundle.exists() or not request.exists():
+            raise ValueError("Host admission record is missing")
+        return bundle, request, None
+    for path in (ADMIN / "invitations").glob("*/record.json"):
+        if json.loads(path.read_text())["name"] == name:
+            return path.parent / "response.json", path.parent / "request.json", path
+    raise ValueError("Unknown device")
+
+
+def refresh(token):
+    if token.startswith("host-"):
+        name = valid_name(token[5:])
+        response, _, _ = member_files(name)
+    elif len(token) == 32 and all(c in "0123456789abcdef" for c in token):
+        record = json.loads((ADMIN / "invitations" / token / "record.json").read_text())
+        name = record["name"]
+        response = ADMIN / "invitations" / token / "response.json"
+        if record.get("revoked"):
+            raise ValueError("Device revoked")
+    else:
+        raise ValueError("Invalid refresh identity")
+    policy = policy_snapshot()
+    if name in policy["revoked_names"]:
+        raise ValueError("Device revoked")
+    bundle = json.loads(response.read_text())
+    bundle["policy"] = policy
+    return bundle
+
+
+def synchronize_policy(policy):
+    results = {}
+    command = ["sudo", "-n", *SYSTEM_PYTHON, "/opt/tknet/lib/tknet.py", "apply-policy"]
+    # Apply the authority last, so revoking the operator does not interrupt other updates.
+    for name in [n for n in HOSTS if n != "tkserver"] + ["tkserver"]:
+        if name in policy["revoked_names"]:
+            continue
+        argv = command if name == "tkserver" else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", name, *command]
+        try:
+            run(argv, input=json.dumps(policy), timeout=15)
+            results[name] = "applied"
+        except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+            results[name] = "pending: " + str(error)
+    write(ADMIN / "policy-delivery.json", json.dumps(results))
+    return results
+
+
+def revoke(name):
+    if name == "tkserver":
+        raise ValueError("The admission authority cannot revoke itself")
+    with (ADMIN / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        bundle_path, request_path, record_path = member_files(name)
+        policy = policy_snapshot()
+        if name not in policy["revoked_names"]:
+            if bundle_path.exists():
+                bundle = json.loads(bundle_path.read_text())
+                remember_certificate(name, bundle)
+                history = json.loads((ADMIN / "history" / (name + ".json")).read_text())
+                policy["fingerprints"] = sorted(set(policy["fingerprints"] + history))
+                key = " ".join(json.loads(request_path.read_text())["ssh_public"].split()[:2])
+                policy["ssh_keys"] = sorted(set(policy["ssh_keys"] + [key]))
+            policy["revoked_names"].append(name)
+            policy["version"] += 1
+            write(ADMIN / "policy.json", json.dumps(policy))
+        if record_path:
+            with (record_path.parent / "lock").open("a") as member_lock:
+                fcntl.flock(member_lock, fcntl.LOCK_EX)
+                record = json.loads(record_path.read_text())
+                record["revoked"] = True
+                write(record_path, json.dumps(record))
+        return synchronize_policy(policy)
+
+
+def renew(name):
+    with (ADMIN / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if name in policy_snapshot()["revoked_names"]:
+            raise ValueError("Revoked devices cannot be renewed")
+        response_path, request_path, record_path = member_files(name)
+        if not response_path.exists():
+            raise ValueError("Device has not enrolled")
+        request = json.loads(request_path.read_text())
+        old = json.loads(response_path.read_text())
+        remember_certificate(name, old)
+        if name in HOSTS:
+            bundle = issue_host(name, request)
+        else:
+            with tempfile.TemporaryDirectory(dir=ADMIN) as temporary:
+                bundle = sign(name, old["address"], "guest", request, Path(temporary))
+            bundle["refresh_token"] = record_path.parent.name
+            write(response_path, json.dumps(bundle))
+            remember_certificate(name, bundle)
+        authorize_refresh(bundle["refresh_token"], request["ssh_public"])
+    info = certificate_info(bundle["node.crt"])
+    result = {"name": name, "expires": info["details"]["notAfter"], "delivery": "client refresh (within 60 seconds while connected, or tknet up)"}
+    if name in HOSTS:
+        command = [*SYSTEM_PYTHON, "/opt/tknet/lib/tknet.py", "accept-renewal"]
+        if name != "tkserver":
+            command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", name, *command]
+        try:
+            run(command, input=json.dumps(bundle), timeout=20)
+            result["delivery"] = "installed"
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            result["delivery"] = "pending: " + str(error) + "; run tknet up on this host"
+    return result
+
+
+def list_members():
+    """List admission records, not inferred online or certificate-valid status."""
+    rows = []
+    revoked = policy_snapshot()["revoked_names"]
+    for name, address in HOSTS.items():
+        issued = ADMIN / "hosts" / (name + ".json")
+        rows.append({"name": name, "role": "host", "address": address,
+                     "state": "revoked" if name in revoked else ("issued" if issued.is_file() else "configured")})
+    for path in sorted((ADMIN / "invitations").glob("*/record.json")):
+        record = json.loads(path.read_text())
+        if record.get("revoked") or record["name"] in revoked:
+            state = "revoked"
+        elif (path.parent / "response.json").is_file():
+            state = "issued"
+        else:
+            state = "invitation-expired" if record["expires"] <= time.time() else "invited"
+        rows.append({"name": record["name"], "role": "guest",
+                     "address": record["address"].split("/")[0], "state": state})
+    return rows
 
 
 def main():
@@ -126,6 +299,9 @@ def main():
     invite_parser.add_argument("name")
     commands.add_parser("enroll").add_argument("token")
     commands.add_parser("issue-host").add_argument("name")
+    commands.add_parser("list").add_argument("--json", action="store_true")
+    for name in ("refresh", "revoke", "renew"):
+        commands.add_parser(name).add_argument("name")
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -134,6 +310,26 @@ def main():
         elif args.command == "invite":
             print(invite(args.name))
             print("Expires in 24 hours; bound to the first device that redeems it.", file=sys.stderr)
+        elif args.command == "list":
+            rows = list_members()
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                print(f"{'NAME':<30} {'ROLE':<7} {'ADDRESS':<16} ADMISSION")
+                for row in rows:
+                    print(f"{row['name']:<30} {row['role']:<7} {row['address']:<16} {row['state']}")
+        elif args.command == "refresh":
+            print(json.dumps(refresh(args.name)))
+        elif args.command == "revoke":
+            results = revoke(args.name)
+            for host, result in results.items():
+                print(f"{host}: {result}")
+            print("Connected guests refresh policy within 60 seconds while the authority is reachable.")
+            return 1 if any(result != "applied" for result in results.values()) else 0
+        elif args.command == "renew":
+            result = renew(args.name)
+            print(json.dumps(result))
+            return 1 if result["delivery"].startswith("pending:") else 0
         else:
             request = json.loads(sys.stdin.read(16384))
             response = enroll(args.token, request) if args.command == "enroll" else issue_host(args.name, request)

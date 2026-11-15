@@ -19,7 +19,9 @@ import sys
 import tempfile
 import time
 
-VERSION = "0.3.3"
+VERSION = "0.4.0"
+INSTALL_ROLE = Path("/opt/tknet/role")
+ADMIN_PROGRAM = Path("/opt/tknet/lib/admin.py")
 SYSTEM_PYTHON = ["/usr/bin/python3", "-Es"]
 TUN_NAME = "tktun"
 BIN = Path("/opt/tknet/bin")
@@ -97,7 +99,8 @@ def nebula_config(role, lighthouse=False, config_dir=CONFIG):
     rules = [{"port": "any", "proto": "any", "group": g} for g in ("host", "guest")]
     return {
         "pki": {"ca": str(config_dir / "ca.crt"), "cert": str(config_dir / "node.crt"),
-                "key": str(config_dir / "node.key"), "disconnect_invalid": True},
+                "key": str(config_dir / "node.key"), "disconnect_invalid": True,
+                "blocklist": []},
         "static_host_map": {} if lighthouse else {SERVER: ["166.111.192.92:3478"]},
         "lighthouse": {"am_lighthouse": lighthouse, "hosts": [] if lighthouse else [SERVER],
                        "local_allow_list": {"interfaces": {"Meta": False, "docker.*": False,
@@ -138,6 +141,9 @@ def write_network_config(bundle, directory):
     if str(ipaddress.IPv4Interface(bundle["address"]).network) != NETWORK:
         raise ValueError("Unexpected mesh subnet")
     config = nebula_config(bundle["role"], bundle["name"] == "tkserver", directory)
+    policy_file = directory / "policy.json"
+    if policy_file.exists():
+        config["pki"]["blocklist"] = json.loads(policy_file.read_text())["fingerprints"]
     for name in ("ca.crt", "node.crt", "node.key"):
         write(directory / name, bundle[name])
     write(directory / "nebula.json", json.dumps(config, indent=2) + "\n")
@@ -314,6 +320,8 @@ def client_run(bundle):
                 raise RuntimeError(f"{TUN_NAME} is already managed by another process")
             directory = RUNTIME / "config"
             write_network_config(bundle, directory)
+            if "policy" in bundle:
+                apply_policy(bundle["policy"], directory, reload=False)
             added = routes_up()
             if stopping:
                 return
@@ -332,7 +340,31 @@ def client_run(bundle):
             names_owned = True
             write(RUNTIME / "state.json", json.dumps({"pid": os.getpid(),
                   "start": process_start(os.getpid()), "address": bundle["address"]}), 0o644)
-            child.wait()
+            next_refresh = time.monotonic() + 30
+            while child.poll() is None and not stopping:
+                try:
+                    child.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    if bundle.get("refresh_token") and bundle.get("_state_dir") and time.monotonic() >= next_refresh:
+                        try:
+                            state_dir = Path(bundle["_state_dir"])
+                            updated = fetch_refresh(bundle, state_dir)
+                            changed = updated["node.crt"] != bundle["node.crt"]
+                            if changed:
+                                write(directory / "node.crt", updated["node.crt"])
+                            if updated.get("policy") != bundle.get("policy"):
+                                apply_policy(updated["policy"], directory, reload=False)
+                                changed = True
+                            save_client_bundle(updated, state_dir)
+                            updated["_state_dir"] = str(state_dir)
+                            bundle = updated
+                            if changed and child.poll() is None:
+                                child.send_signal(signal.SIGHUP)
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                            print(f"Membership refresh failed: {error}", file=sys.stderr, flush=True)
+                            if "Device revoked" in str(error):
+                                child.terminate()
+                        next_refresh = time.monotonic() + 30
         finally:
             if child is not None and child.poll() is None:
                 child.terminate()
@@ -389,7 +421,7 @@ def client_stop():
         configure_hostnames(False)
         return
     os.kill(state["pid"], signal.SIGTERM)
-    for _ in range(100):
+    for _ in range(300):
         if process_start(state["pid"]) != state["start"]:
             configure_hostnames(False)
             return
@@ -444,6 +476,89 @@ WantedBy=tknet.service
     run(["systemctl", "reload", "ssh"])
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now", "tknet-sshd.service"])
+    install_management_helpers()
+
+
+def install_management_helpers():
+    rule = "tinker ALL=(root) NOPASSWD: /usr/bin/python3 -Es /opt/tknet/lib/tknet.py apply-policy, /usr/bin/python3 -Es /opt/tknet/lib/tknet.py install-renewal\n"
+    write("/etc/sudoers.d/tknet-management", rule, 0o440)
+    run(["visudo", "-cf", "/etc/sudoers.d/tknet-management"])
+
+
+def certificate_info(certificate):
+    return json.loads(run([BIN / "nebula-cert", "print", "-json", "-path", "-"], input=certificate))[0]
+
+
+def apply_policy(policy, directory=CONFIG, reload=True):
+    """Install a full revocation snapshot; reject rollback and malformed input."""
+    if os.geteuid():
+        raise RuntimeError("Policy installation requires root")
+    with (directory / "policy.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        apply_policy_locked(policy, directory, reload)
+
+
+def apply_policy_locked(policy, directory, reload):
+    if not isinstance(policy.get("version"), int) or policy["version"] < 0:
+        raise ValueError("Invalid policy version")
+    fingerprints = policy.get("fingerprints", [])
+    keys = policy.get("ssh_keys", [])
+    if not isinstance(fingerprints, list) or not all(isinstance(f, str) and re.fullmatch(r"[0-9a-f]{64}", f) for f in fingerprints):
+        raise ValueError("Invalid certificate blocklist")
+    if not isinstance(keys, list) or not all(isinstance(k, str) and re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+", k) for k in keys):
+        raise ValueError("Invalid SSH revocation keys")
+    previous = directory / "policy.json"
+    old = json.loads(previous.read_text()) if previous.exists() else {"version": -1}
+    if policy["version"] < old["version"]:
+        raise ValueError("Refusing an older revocation policy")
+    if policy["version"] == old["version"] and policy != old:
+        raise ValueError("Conflicting revocation policy version")
+    config_path = directory / "nebula.json"
+    config = json.loads(config_path.read_text())
+    config["pki"]["blocklist"] = fingerprints
+    with tempfile.TemporaryDirectory(dir=directory) as temporary:
+        staging = Path(temporary)
+        write(staging / "nebula.json", json.dumps(config))
+        run([BIN / "nebula", "-test", "-config", staging / "nebula.json"])
+        if directory == CONFIG:
+            write(staging / "keys.pub", "\n".join(keys) + "\n")
+            run(["ssh-keygen", "-k", "-f", staging / "revoked.krl", staging / "keys.pub"])
+            os.chmod(staging / "revoked.krl", 0o644)
+            (staging / "revoked.krl").replace(directory / "revoked.krl")
+            sshd = directory / "sshd_config"
+            settings = sshd.read_text()
+            directive = "RevokedKeys /etc/tknet/revoked.krl\n"
+            if directive not in settings:
+                write(sshd, settings.rstrip() + "\n" + directive, 0o644)
+            run(["/usr/sbin/sshd", "-t", "-f", sshd])
+        (staging / "nebula.json").replace(config_path)
+    write(previous, json.dumps(policy))
+    if reload and directory == CONFIG:
+        run(["systemctl", "reload", "tknet.service"])
+        run(["systemctl", "kill", "--kill-who=main", "-s", "HUP", "tknet-sshd.service"])
+
+
+def install_renewal(bundle):
+    if os.geteuid():
+        raise RuntimeError("Certificate installation requires root")
+    old = certificate_info((CONFIG / "node.crt").read_text())
+    new = certificate_info(bundle["node.crt"])
+    for field in ("name", "networks", "groups"):
+        if old["details"][field] != new["details"][field]:
+            raise ValueError("Renewal changed device identity")
+    if old["publicKey"] != new["publicKey"]:
+        raise ValueError("Renewal changed the device key")
+    with tempfile.TemporaryDirectory(dir=CONFIG) as temporary:
+        certificate = Path(temporary) / "node.crt"
+        write(certificate, bundle["node.crt"])
+        run([BIN / "nebula-cert", "verify", "-ca", CONFIG / "ca.crt", "-crt", certificate])
+        certificate.replace(CONFIG / "node.crt")
+    write(CONFIG / "ssh-host-cert.pub", bundle["ssh-host-cert.pub"], 0o644)
+    if "policy" in bundle:
+        apply_policy(bundle["policy"], reload=False)
+    run(["/usr/sbin/sshd", "-t", "-f", CONFIG / "sshd_config"])
+    run(["systemctl", "reload", "tknet.service"])
+    run(["systemctl", "kill", "--kill-who=main", "-s", "HUP", "tknet-sshd.service"])
 
 
 def configure_host_firewall():
@@ -501,6 +616,46 @@ def enrollment(invite, state):
     bundle["node.key"] = (state / "node.key").read_text()
     write(state / "bundle.json", json.dumps(bundle))
     return bundle
+
+
+def fetch_refresh(bundle, state):
+    with tempfile.TemporaryDirectory(prefix="tknet-refresh-") as temporary:
+        known = Path(temporary) / "known_hosts"
+        write(known, f"[{ENROLLMENT_SERVER}]:{ENROLLMENT_PORT} {ENROLLMENT_HOST_KEY}\n")
+        response = run(["ssh", "-F", "/dev/null", "-T", "-p", str(ENROLLMENT_PORT),
+                        "-i", state / "id_ed25519", "-o", "CertificateFile=none",
+                        "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                        "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=5",
+                        "-o", f"UserKnownHostsFile={known}",
+                        f"tinker@{ENROLLMENT_SERVER}", "refresh"], timeout=10)
+    updated = json.loads(response)
+    for field in ("name", "address", "role"):
+        if updated[field] != bundle[field]:
+            raise ValueError("Membership refresh changed device identity")
+    if certificate_info(updated["node.crt"])["publicKey"] != certificate_info(bundle["node.crt"])["publicKey"]:
+        raise ValueError("Membership refresh changed the device key")
+    updated["node.key"] = bundle.get("node.key", (state / "node.key").read_text())
+    return updated
+
+
+def save_client_bundle(bundle, state):
+    owner = state.stat()
+    public_bundle = {k: v for k, v in bundle.items() if not k.startswith("_")}
+    for name, content, mode in (("bundle.json", json.dumps(public_bundle), 0o600),
+                                ("id_ed25519-cert.pub", bundle["ssh-user-cert.pub"], 0o644)):
+        write(state / name, content, mode)
+        if os.geteuid() == 0:
+            os.chown(state / name, owner.st_uid, owner.st_gid)
+
+
+def accept_renewal(bundle):
+    old = json.loads((STATE / "issued.json").read_text())
+    for field in ("name", "address", "role"):
+        if old[field] != bundle[field]:
+            raise ValueError("Renewal changed device identity")
+    run(["sudo", "-n", *SYSTEM_PYTHON, "/opt/tknet/lib/tknet.py", "install-renewal"], input=json.dumps(bundle))
+    write(STATE / "issued.json", json.dumps({k: v for k, v in bundle.items() if k != "node.key"}))
+    configure_ssh(bundle, STATE, Path.home() / ".ssh")
 
 
 def configure_hostnames(enabled):
@@ -563,11 +718,20 @@ def privileged(command, bundle=None):
 def up(value=None):
     if not (BIN / "nebula").is_file():
         raise RuntimeError("Run the tknet installer to install Nebula first")
+    if (STATE / "issued.json").exists() and not value:
+        bundle = json.loads((STATE / "issued.json").read_text())
+        accept_renewal(fetch_refresh(bundle, STATE))
+        print("Host certificates refreshed.")
+        return
     if (STATE / "bundle.json").exists() and not value:
         bundle = json.loads((STATE / "bundle.json").read_text())
+        if bundle.get("refresh_token") or bundle.get("name"):
+            bundle = fetch_refresh(bundle, STATE)
+            save_client_bundle(bundle, STATE)
     else:
         value = value or getpass.getpass("Invitation: ")
         bundle = enrollment(invitation_data(value), STATE)
+    bundle["_state_dir"] = str(STATE)
     started = json.loads(privileged("client-start", bundle))["started"]
     try:
         for attempt in range(15):
@@ -593,27 +757,53 @@ def down():
     print("Disconnected. Run tknet up to reconnect.")
 
 
-def main():
+def server_installation():
+    return INSTALL_ROLE.is_file() and INSTALL_ROLE.read_text().strip() == "server"
+
+
+def command_parser(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
+    public_commands = ["up", "down", "status"]
+    if server_installation():
+        public_commands += ["invite", "list", "revoke", "renew"]
     commands = parser.add_subparsers(dest="command", required=True,
-                                    metavar="{up,down,status,invite}")
+                                    metavar="{" + ",".join(public_commands) + "}")
     commands.add_parser("up", help="Connect on demand").add_argument("invitation", nargs="?")
     commands.add_parser("down", help="Stop this connection")
     commands.add_parser("status", help="Show the current connection")
-    invite = commands.add_parser("invite", help="Approve a guest on tkserver")
-    invite.add_argument("name")
-    commands.add_parser("install-network")
-    commands.add_parser("install-host")
-    for command in ("client-start", "client-run", "client-stop", "routes-up", "routes-down", "names-up"):
-        commands.add_parser(command)
-    args = parser.parse_args()
+    if server_installation():
+        commands.add_parser("invite", help="Issue a guest invitation").add_argument("name")
+        commands.add_parser("list", help="List registered devices and invitations").add_argument("--json", action="store_true")
+        commands.add_parser("revoke", help="Revoke membership and distribute the blocklist").add_argument("name")
+        commands.add_parser("renew", help="Renew certificates using the existing device keys").add_argument("name")
+    # Root-only entry points used by the runtime and service units, not user commands.
+    internal = {"install-network", "install-host", "client-start", "client-run", "client-stop",
+                "routes-up", "routes-down", "names-up", "apply-policy", "install-renewal", "install-helpers"}
+    if argv and argv[0] in internal and os.geteuid() == 0:
+        commands.add_parser(argv[0])
+    if argv and argv[0] == "accept-renewal":
+        commands.add_parser("accept-renewal")
+    return parser
+
+
+def main():
+    args = command_parser(sys.argv[1:]).parse_args()
     try:
         if args.command == "up":
             up(args.invitation)
-        elif args.command == "invite":
-            result = subprocess.run([*SYSTEM_PYTHON, "/opt/tknet/lib/admin.py", "invite", args.name])
+        elif args.command in ("invite", "list", "revoke", "renew"):
+            if not ADMIN_PROGRAM.is_file():
+                raise RuntimeError("Server management module is missing; reinstall with --server")
+            arguments = (["--json"] if args.json else []) if args.command == "list" else [args.name]
+            result = subprocess.run([*SYSTEM_PYTHON, ADMIN_PROGRAM, args.command, *arguments])
             return result.returncode
+        elif args.command in ("apply-policy", "install-renewal", "accept-renewal"):
+            payload = json.loads(sys.stdin.read(1048576))
+            {"apply-policy": apply_policy, "install-renewal": install_renewal,
+             "accept-renewal": accept_renewal}[args.command](payload)
+        elif args.command == "install-helpers":
+            install_management_helpers()
         elif args.command.startswith("install-"):
             bundle = json.loads(sys.stdin.read(131072))
             (install_host if args.command == "install-host" else install_network)(bundle)
@@ -631,7 +821,15 @@ def main():
             (client_start if args.command == "client-start" else client_run)(bundle)
         else:
             state = client_state()
-            print(f"Connected: {state['address']} (PID {state['pid']})" if state else "Client disconnected")
+            host_state = STATE / "issued.json"
+            if state:
+                print(f"Connected: {state['address']} (PID {state['pid']})")
+            elif host_state.is_file():
+                host = json.loads(host_state.read_text())
+                print(f"Host: {host['name']} ({host['address']})")
+            else:
+                print("Client disconnected")
+            print("Installation: " + ("server" if server_installation() else "client"))
             if Path(f"/sys/class/net/{TUN_NAME}").exists():
                 print(f"Interface: {TUN_NAME}")
         return 0

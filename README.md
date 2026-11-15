@@ -72,16 +72,58 @@ The v0.3 CLI uses `up` and `down` in place of `join` and `leave`.
 
 ## Admission on tkserver
 
-Run as tinker after the authority has been initialized:
+The same source supports two installation roles. The default client has only
+`up`, `down` and `status`; it does not install the management module. Install
+the server role on tkserver with:
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/tinkerfuroc/tknet/main/install.sh | sh -s -- --server
+```
+
+An ordinary upgrade preserves the installed role. `--client` explicitly
+selects the client role and removes a previously installed management module.
+Installation role is separate from Nebula membership: tkmain, tkbox and tkmini
+are network hosts but use the client CLI. Internal root helpers are not shown
+as user commands. Guests still need no systemd service.
+
+Run management commands as tinker on tkserver after authority initialization:
+
+```sh
+tknet list
+tknet list --json
 tknet invite laptop-name
+tknet renew laptop-name
+tknet revoke laptop-name
 ```
 
 The command prints the code to stdout and its 24-hour validity to stderr.
 Send the code privately to that guest. It permits enrollment only,
 not an interactive server login. The device creates its own keys and receives
 Nebula membership and a user certificate restricted to the tinker SSH principal.
+
+`list` shows admission records, not online status. `renew` issues another year
+using the existing device public keys, address and role. Online hosts receive
+their certificates immediately. Connected v0.4 guests refresh certificates
+and policy through the existing native SSH endpoint every 30 seconds; allow
+up to 60 seconds while the authority is reachable. Disconnected clients fetch
+them at the next `tknet up`. The restricted refresh key remains usable after
+certificate expiry, but can only retrieve that device's records, not a shell.
+An offline host can fetch its renewed certificates with `tknet up` too.
+
+`revoke` cancels unredeemed invitations, refuses future renewal/refresh, and
+blocks all recorded Nebula certificate versions plus the device's SSH public
+key. It distributes a full Nebula blocklist and OpenSSH KRL to every remaining
+host. Nebula tears down blocked tunnels. If any host cannot be updated, the
+command reports it as `pending` and returns nonzero; that host has not yet
+enforced the revocation. Run the same revoke command again after connectivity
+is restored. It is idempotent. Guest policy refresh requires v0.4 clients.
+Revoking tkserver itself is not supported. Native personal recovery SSH keys
+are outside mesh membership and are not removed.
+
+The operator accepts that anyone able to log in as tinker on tkserver can
+manage admission. This is an installation-role split, not a separate human
+administrator privilege model. Device private keys remain on each device;
+authority records and refresh responses contain only public credentials.
 
 All hosts accept traffic from approved hosts and guests. No role may initiate
 new connections to a guest. The overlay SSH server accepts only tinker and
@@ -103,8 +145,10 @@ became unreachable through both native and mesh SSH, then recovered; the cause
 is not established. The v0.3.3 rollout verified tkbox-to-tkmini SSH in both
 directions and HTTP 200 from wkj-pi, tkbox and tkmini at `http://tkmain:9860/`.
 Guest up/down/repeated-up tests preserved unrelated hosts entries and installed
-only one managed block. Guest membership is currently valid for one year;
-automated renewal and operational revocation commands are pending. FRP was
+only one managed block. Version v0.4.0 passed isolated live guest enrollment,
+automatic renewal, revoked SSH-certificate rejection, HTTP denial, and active
+session termination. Normal guest HTTP remained available; tkmini host renewal
+was installed successfully. Guest membership is valid for one year. FRP was
 retired on 2026-11-15: server and client services are stopped and disabled.
 Native direct SSH remains available through the local `*-ssh` aliases.
 UDP reachability is required even when relaying.

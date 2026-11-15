@@ -3,6 +3,8 @@
 import base64
 from contextlib import ExitStack
 import json
+import io
+import os
 from pathlib import Path
 import subprocess
 import struct
@@ -13,6 +15,56 @@ from unittest.mock import patch
 
 import admin
 import tknet
+
+
+class InstallationRoleTests(unittest.TestCase):
+    def test_installer_client_server_and_upgrade_roles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prefix = root / "opt"
+            binaries = prefix / "bin"
+            binaries.mkdir(parents=True)
+            for name in ("nebula", "nebula-cert"):
+                tknet.write(binaries / name, "#!/bin/sh\necho 'Version: 1.12.0'\n", 0o755)
+            fakebin = root / "fakebin"
+            fakebin.mkdir()
+            tknet.write(fakebin / "sudo", '#!/bin/sh\nexec "$@"\n', 0o755)
+            fixture = Path(__file__).parent.resolve()
+            downloader = "#!/usr/bin/python3\nimport pathlib,shutil,sys\na=sys.argv[1:]\nu=next(x for x in a if x.startswith('https:'))\nname=u.rsplit('/',1)[-1]\nassert name in ('tknet.py','admin.py')\nshutil.copyfile(pathlib.Path(" + repr(str(fixture)) + ")/name,a[a.index('-o')+1])\n"
+            tknet.write(fakebin / "curl", downloader, 0o755)
+            script = root / "install.sh"
+            content = (fixture / "install.sh").read_text().replace("/opt/tknet", str(prefix)).replace("/etc/tknet", str(root / "etc"))
+            script.write_text(content)
+            environment = {**os.environ, "PATH": str(fakebin) + ":" + os.environ["PATH"], "TKNET_INSTALL_DIR": str(root / "cli")}
+            for arguments, role in (([], "client"), (["--server"], "server"), ([], "server"), (["--client"], "client")):
+                subprocess.run(["sh", str(script), *arguments], env=environment, capture_output=True, check=True)
+                self.assertEqual((prefix / "role").read_text().strip(), role)
+                self.assertEqual((prefix / "lib/admin.py").exists(), role == "server")
+
+    def test_client_does_not_offer_or_accept_admin_commands(self):
+        with patch("tknet.server_installation", return_value=False):
+            help_text = tknet.command_parser([]).format_help()
+            self.assertNotIn("invite", help_text)
+            self.assertNotIn("install-host", help_text)
+            self.assertNotIn("client-run", help_text)
+            for command in ("invite", "list", "revoke", "renew"):
+                with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit) as error:
+                    tknet.command_parser([command]).parse_args([command])
+                self.assertEqual(error.exception.code, 2)
+
+    def test_server_offers_only_implemented_management_commands(self):
+        with patch("tknet.server_installation", return_value=True):
+            parser = tknet.command_parser([])
+            self.assertEqual(parser.parse_args(["invite", "laptop"]).name, "laptop")
+            self.assertTrue(parser.parse_args(["list", "--json"]).json)
+            self.assertNotIn("client-run", parser.format_help())
+
+    def test_internal_commands_require_root(self):
+        with patch("tknet.server_installation", return_value=False):
+            with patch("tknet.os.geteuid", return_value=0):
+                self.assertEqual(tknet.command_parser(["client-run"]).parse_args(["client-run"]).command, "client-run")
+            with patch("tknet.os.geteuid", return_value=1000), patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+                tknet.command_parser(["client-run"]).parse_args(["client-run"])
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -136,6 +188,25 @@ class ClientLifecycleTests(unittest.TestCase):
             run.assert_not_called()
 
 
+class PolicyTests(unittest.TestCase):
+    def test_policy_install_rejects_rollback_and_keeps_cached_revocations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tknet.write(root / "nebula.json", json.dumps({"pki": {}}))
+            policy = {"version": 2, "fingerprints": ["a" * 64], "ssh_keys": [], "revoked_names": ["lost-device"]}
+            with patch("tknet.os.geteuid", return_value=0), patch("tknet.run"):
+                tknet.apply_policy(policy, root, reload=False)
+                tknet.apply_policy(policy, root, reload=False)
+                with self.assertRaisesRegex(ValueError, "older"):
+                    tknet.apply_policy({**policy, "version": 1}, root, reload=False)
+                with self.assertRaisesRegex(ValueError, "Conflicting"):
+                    tknet.apply_policy({**policy, "fingerprints": []}, root, reload=False)
+                with self.assertRaisesRegex(ValueError, "blocklist"):
+                    tknet.apply_policy({**policy, "fingerprints": ["invalid"]}, root, reload=False)
+            self.assertEqual(json.loads((root / "policy.json").read_text()), policy)
+            self.assertEqual(json.loads((root / "nebula.json").read_text())["pki"]["blocklist"], ["a" * 64])
+
+
 class HostnameTests(unittest.TestCase):
     def test_firewall_rule_is_scoped_to_the_mesh(self):
         with patch("tknet.shutil.which", return_value="/usr/sbin/ufw"), patch("tknet.run", return_value="Status: active\n") as run:
@@ -206,6 +277,8 @@ class AdmissionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        self.home_patch = patch("admin.Path.home", return_value=self.root)
+        self.home_patch.start()
         self.patch = patch.object(admin, "ADMIN", self.root / "authority")
         self.patch.start()
         admin.initialize()
@@ -218,6 +291,7 @@ class AdmissionTests(unittest.TestCase):
         tknet.write(self.directory / "record.json", json.dumps({"name": "test-guest", "address": "10.27.0.100/24", "expires": time.time() + 60}))
 
     def tearDown(self):
+        self.home_patch.stop()
         self.patch.stop()
         self.tmp.cleanup()
 
@@ -232,6 +306,68 @@ class AdmissionTests(unittest.TestCase):
         tknet.write(self.root / "ca.crt", first["ca.crt"])
         tknet.write(self.root / "node.crt", first["node.crt"])
         tknet.run([tknet.BIN / "nebula-cert", "verify", "-ca", self.root / "ca.crt", "-crt", self.root / "node.crt"])
+
+    def test_list_reports_admission_without_exposing_credentials(self):
+        def guest():
+            return next(row for row in admin.list_members() if row["name"] == "test-guest")
+        self.assertEqual(guest()["state"], "invited")
+        record = json.loads((self.directory / "record.json").read_text())
+        record["expires"] = time.time() - 1
+        tknet.write(self.directory / "record.json", json.dumps(record))
+        self.assertEqual(guest()["state"], "invitation-expired")
+        record["expires"] = time.time() + 60
+        tknet.write(self.directory / "record.json", json.dumps(record))
+        admin.enroll(self.token, self.request)
+        self.assertEqual(guest()["state"], "issued")
+        self.assertEqual(set(guest()), {"name", "role", "address", "state"})
+
+    def test_renew_preserves_keys_and_revocation_blocks_all_entry_points(self):
+        old = admin.enroll(self.token, self.request)
+        outcome = admin.renew("test-guest")
+        self.assertEqual(outcome["name"], "test-guest")
+        new = admin.refresh(self.token)
+        for key in ("name", "address", "role"):
+            self.assertEqual(old[key], new[key])
+        self.assertEqual(tknet.certificate_info(old["node.crt"])["publicKey"], tknet.certificate_info(new["node.crt"])["publicKey"])
+        with patch("admin.synchronize_policy", return_value={"tkserver": "applied"}):
+            admin.revoke("test-guest")
+            version = admin.policy_snapshot()["version"]
+            admin.revoke("test-guest")
+        self.assertEqual(admin.policy_snapshot()["version"], version)
+        self.assertIn(tknet.certificate_info(old["node.crt"])["fingerprint"], admin.policy_snapshot()["fingerprints"])
+        for operation in (lambda: admin.enroll(self.token, self.request), lambda: admin.refresh(self.token), lambda: admin.renew("test-guest")):
+            with self.assertRaisesRegex(ValueError, "[Rr]evoked"):
+                operation()
+
+    def test_revoke_unused_invitation_prevents_enrollment(self):
+        with patch("admin.synchronize_policy", return_value={}):
+            admin.revoke("test-guest")
+        with self.assertRaisesRegex(ValueError, "revoked"):
+            admin.enroll(self.token, self.request)
+
+    def test_failed_policy_delivery_is_reported(self):
+        with patch("admin.run", side_effect=RuntimeError("unreachable")):
+            result = admin.synchronize_policy(admin.policy_snapshot())
+        self.assertTrue(all(value.startswith("pending:") for value in result.values()))
+
+    def test_real_ssh_revocation_rejects_device_certificate(self):
+        bundle = admin.enroll(self.token, self.request)
+        certificate = self.root / "device-cert.pub"
+        key = self.root / "revoked.pub"
+        krl = self.root / "revoked.krl"
+        tknet.write(certificate, bundle["ssh-user-cert.pub"])
+        tknet.write(key, self.request["ssh_public"])
+        tknet.run(["ssh-keygen", "-k", "-f", krl, key])
+        result = subprocess.run(["ssh-keygen", "-Q", "-f", str(krl), str(certificate)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("REVOKED", result.stdout)
+
+    def test_host_issuance_records_public_membership(self):
+        request = {**self.request, "ssh_host_public": self.request["ssh_public"]}
+        bundle = admin.issue_host("tkbox", request)
+        self.assertEqual(json.loads((admin.ADMIN / "hosts/tkbox.json").read_text()), bundle)
+        self.assertNotIn("node.key", bundle)
+        self.assertEqual(next(row for row in admin.list_members() if row["name"] == "tkbox")["state"], "issued")
 
     def test_used_invitation_cannot_enroll_different_keys(self):
         admin.enroll(self.token, self.request)
