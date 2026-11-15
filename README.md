@@ -10,7 +10,7 @@ SSH handles admission.
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tinkerfuroc/tknet/main/install.sh | sh
 tknet up <invitation-code>
-ssh tinker@tkmain
+ssh tkmain
 ```
 
 Requires Linux with TUN support, system Python 3.9+ at `/usr/bin/python3`,
@@ -50,6 +50,10 @@ Repeated `up` calls reuse the running connection instead of starting duplicates.
 SSH overrides. It preserves the identity. Hosts still use persistent services.
 The original SSH configuration is preserved and backed up before the first join.
 Friendly names are local SSH aliases; other applications can use mesh IPs.
+The approved hosts are tkserver (`10.27.0.1`), tkmain (`10.27.0.2`), tkbox
+(`10.27.0.3`) and tkmini (`10.27.0.4`). Each alias selects the `tinker` user.
+After upgrading the client, run `tknet up` to refresh aliases without replacing
+the existing identity or requesting another invitation.
 
 The client runtime is under `/run/tknet-client`; logs are in
 `/var/log/tknet-client.log`. Creating a virtual network interface requires root,
@@ -85,8 +89,11 @@ interface and owned policy rules; repeated up kept the same runtime process.
 The client does not change the persistent services running on hosts.
 
 The tkserver / tkmain / wkj-pi path has passed invitation redemption, join,
-SSH login, direct transport and forced relay tests. tkbox and tkmini are not yet
-enrolled in this version. Guest membership is currently valid for one year;
+SSH login, direct transport and forced relay tests. Version v0.3.2 enrolls tkbox
+and tkmini. Both passed SSH login from wkj-pi, tkserver and tkmain, outbound SSH
+to existing hosts, and rejection of new connections to the guest. tkbox later
+became unreachable through both native and mesh SSH; its ongoing availability
+has not been accepted. tkmini remains reachable. Guest membership is currently valid for one year;
 automated renewal and operational revocation commands are pending. The existing
 FRP fallback remains available. UDP reachability is required even when relaying.
 

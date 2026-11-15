@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 SYSTEM_PYTHON = ["/usr/bin/python3", "-Es"]
 TUN_NAME = "tktun"
 BIN = Path("/opt/tknet/bin")
@@ -28,7 +28,7 @@ RUNTIME = Path("/run/tknet-client")
 CLIENT_LOG = Path("/var/log/tknet-client.log")
 NETWORK = "10.27.0.0/24"
 SERVER = "10.27.0.1"
-HOSTS = {"tkserver": SERVER, "tkmain": "10.27.0.2"}
+HOSTS = {"tkserver": SERVER, "tkmain": "10.27.0.2", "tkbox": "10.27.0.3", "tkmini": "10.27.0.4"}
 ENROLLMENT_SERVER = "166.111.192.92"
 ENROLLMENT_PORT = 12002
 ENROLLMENT_HOST_KEY = (
@@ -488,7 +488,8 @@ def configure_ssh(bundle, state, ssh_dir):
     ssh_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     write(state / "id_ed25519-cert.pub", bundle["ssh-user-cert.pub"], 0o644)
     lines, known = [], []
-    for name, address in bundle["hosts"].items():
+    # Refresh known hosts after a client upgrade without reissuing its identity.
+    for name, address in {**bundle["hosts"], **HOSTS}.items():
         valid_name(name)
         ipaddress.IPv4Address(address)
         lines.extend([f"Host {name}", f"    HostName {address}", "    Port 22", "    User tinker",
@@ -538,7 +539,7 @@ def up(value=None):
         if started:
             privileged("client-stop")
         raise
-    print("Connected. Log in with: ssh tinker@tkmain")
+    print("Connected. Log in with: ssh tkmain")
 
 
 def down():

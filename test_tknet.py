@@ -76,7 +76,8 @@ class ConfigurationTests(unittest.TestCase):
             ssh.mkdir()
             original = "Host old\n    HostName 1.2.3.4\n"
             (ssh / "config").write_text(original)
-            bundle = {"hosts": tknet.HOSTS, "ssh-user-cert.pub": "test", "ssh-host-ca.pub": "ssh-ed25519 test"}
+            bundle = {"hosts": {"tkserver": tknet.SERVER, "tkmain": "10.27.0.2"},
+                      "ssh-user-cert.pub": "test", "ssh-host-ca.pub": "ssh-ed25519 test"}
             for _ in range(2):
                 tknet.configure_ssh(bundle, root / "state", ssh)
             self.assertEqual((ssh / "config").read_text().count("Include "), 1)
@@ -85,6 +86,10 @@ class ConfigurationTests(unittest.TestCase):
             resolved = tknet.run(["ssh", "-G", "-F", ssh / "config", "tkmain"])
             self.assertIn("hostname 10.27.0.2\n", resolved)
             self.assertIn("port 22\n", resolved)
+            for name, address in tknet.HOSTS.items():
+                resolved = tknet.run(["ssh", "-G", "-F", ssh / "config", name])
+                self.assertIn(f"hostname {address}\n", resolved)
+                self.assertIn("user tinker\n", resolved)
 
 
 class ClientLifecycleTests(unittest.TestCase):
