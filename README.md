@@ -5,7 +5,7 @@ A Linux guest client for the TK mesh. It uses Python 3.9 or newer and the offici
 ## Install
 
 ```bash
-curl -fsSL https://github.com/tinkerfuroc/tknet/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tinkerfuroc/tknet/main/install.sh | sh
 ```
 
 The installer puts `tknet` in `~/.local/bin` without sudo. Set `TKNET_INSTALL_DIR`

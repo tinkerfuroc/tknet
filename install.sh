@@ -2,8 +2,8 @@
 set -eu
 
 main() {
-    version=v0.1.0
-    asset="https://github.com/tinkerfuroc/tknet/releases/download/$version/tknet"
+    version=v0.1.1
+    asset="https://raw.githubusercontent.com/tinkerfuroc/tknet/$version/tknet.py"
 
     if [ "$(uname -s)" != Linux ]; then
         printf '%s\n' 'tknet currently supports Linux.' >&2
