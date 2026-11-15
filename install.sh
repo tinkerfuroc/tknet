@@ -2,7 +2,7 @@
 set -eu
 
 main() {
-    version=v0.4.0
+    version=v0.4.1
     role=client
     if [ -f /opt/tknet/role ]; then
         role=$(cat /opt/tknet/role)

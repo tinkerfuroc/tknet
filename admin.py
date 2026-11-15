@@ -299,7 +299,9 @@ def main():
     invite_parser.add_argument("name")
     commands.add_parser("enroll").add_argument("token")
     commands.add_parser("issue-host").add_argument("name")
-    commands.add_parser("list").add_argument("--json", action="store_true")
+    listing = commands.add_parser("list")
+    listing.add_argument("--json", action="store_true")
+    listing.add_argument("-a", "--all", action="store_true", help="Include revoked devices")
     for name in ("refresh", "revoke", "renew"):
         commands.add_parser(name).add_argument("name")
     args = parser.parse_args()
@@ -312,6 +314,8 @@ def main():
             print("Expires in 24 hours; bound to the first device that redeems it.", file=sys.stderr)
         elif args.command == "list":
             rows = list_members()
+            if not args.all:
+                rows = [row for row in rows if row["state"] != "revoked"]
             if args.json:
                 print(json.dumps(rows))
             else:

@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 INSTALL_ROLE = Path("/opt/tknet/role")
 ADMIN_PROGRAM = Path("/opt/tknet/lib/admin.py")
 SYSTEM_PYTHON = ["/usr/bin/python3", "-Es"]
@@ -774,7 +774,9 @@ def command_parser(argv):
     commands.add_parser("status", help="Show the current connection")
     if server_installation():
         commands.add_parser("invite", help="Issue a guest invitation").add_argument("name")
-        commands.add_parser("list", help="List registered devices and invitations").add_argument("--json", action="store_true")
+        listing = commands.add_parser("list", help="List registered devices and invitations")
+        listing.add_argument("--json", action="store_true")
+        listing.add_argument("-a", "--all", action="store_true", help="Include revoked devices")
         commands.add_parser("revoke", help="Revoke membership and distribute the blocklist").add_argument("name")
         commands.add_parser("renew", help="Renew certificates using the existing device keys").add_argument("name")
     # Root-only entry points used by the runtime and service units, not user commands.
@@ -796,6 +798,8 @@ def main():
             if not ADMIN_PROGRAM.is_file():
                 raise RuntimeError("Server management module is missing; reinstall with --server")
             arguments = (["--json"] if args.json else []) if args.command == "list" else [args.name]
+            if args.command == "list" and args.all:
+                arguments.append("--all")
             result = subprocess.run([*SYSTEM_PYTHON, ADMIN_PROGRAM, args.command, *arguments])
             return result.returncode
         elif args.command in ("apply-policy", "install-renewal", "accept-renewal"):

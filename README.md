@@ -90,6 +90,7 @@ Run management commands as tinker on tkserver after authority initialization:
 
 ```sh
 tknet list
+tknet list -a
 tknet list --json
 tknet invite laptop-name
 tknet renew laptop-name
@@ -101,7 +102,9 @@ Send the code privately to that guest. It permits enrollment only,
 not an interactive server login. The device creates its own keys and receives
 Nebula membership and a user certificate restricted to the tinker SSH principal.
 
-`list` shows admission records, not online status. `renew` issues another year
+`list` shows admission records, not online status. It hides revoked devices
+unless `-a` or `--all` is given; the same rule applies to `--json` output.
+`renew` issues another year
 using the existing device public keys, address and role. Online hosts receive
 their certificates immediately. Connected v0.4 guests refresh certificates
 and policy through the existing native SSH endpoint every 30 seconds; allow
