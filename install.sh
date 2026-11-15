@@ -2,7 +2,8 @@
 set -eu
 
 main() {
-    version=v0.1.1
+    version=v0.2.0
+    nebula_version=v1.12.0
     asset="https://raw.githubusercontent.com/tinkerfuroc/tknet/$version/tknet.py"
 
     if [ "$(uname -s)" != Linux ]; then
@@ -21,8 +22,26 @@ main() {
     trap 'rm -rf -- "$temporary_dir"' EXIT
     trap 'exit 1' HUP INT TERM
 
+    case "$(uname -m)" in
+        x86_64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) printf '%s\n' 'Supported architectures: amd64 and arm64.' >&2; exit 1 ;;
+    esac
+    curl --proto '=https' --proto-redir '=https' -fsSL \
+        "https://github.com/slackhq/nebula/releases/download/$nebula_version/nebula-linux-$arch.tar.gz" \
+        -o "$temporary_dir/nebula.tar.gz"
+    tar -xzf "$temporary_dir/nebula.tar.gz" -C "$temporary_dir" nebula nebula-cert
+    sudo install -d -m 755 /opt/tknet/bin
+    sudo install -m 755 "$temporary_dir/nebula" "$temporary_dir/nebula-cert" /opt/tknet/bin/
+
     curl --proto '=https' --proto-redir '=https' -fsSL "$asset" -o "$temporary_dir/tknet"
     python3 "$temporary_dir/tknet" --help >/dev/null
+    curl --proto '=https' --proto-redir '=https' -fsSL \
+        "https://raw.githubusercontent.com/tinkerfuroc/tknet/$version/admin.py" \
+        -o "$temporary_dir/admin.py"
+    sudo install -d -m 755 /opt/tknet/lib
+    sudo install -m 644 "$temporary_dir/tknet" /opt/tknet/lib/tknet.py
+    sudo install -m 644 "$temporary_dir/admin.py" /opt/tknet/lib/admin.py
     chmod 755 "$temporary_dir/tknet"
     mv -fT -- "$temporary_dir/tknet" "$install_dir/tknet"
 
@@ -31,9 +50,6 @@ main() {
         *":$install_dir:"*) printf '%s\n' 'Run tknet join to enter an invitation.' ;;
         *) printf '%s\n' "Add $install_dir to PATH, or run $install_dir/tknet join." ;;
     esac
-    if ! command -v tailscale >/dev/null 2>&1; then
-        printf '%s\n' 'Install and start Tailscale before joining.' 'https://tailscale.com/download/linux'
-    fi
 }
 
 main "$@"

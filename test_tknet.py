@@ -1,75 +1,105 @@
-"""Offline checks for enrollment, retries and guest role handling."""
+"""Offline checks using real Nebula and OpenSSH certificate tools."""
 
+import base64
 import json
 from pathlib import Path
+import subprocess
+import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
-from tknet import Client
+import admin
+import tknet
 
 
-RUNNING = {
-    "BackendState": "Running",
-    "Self": {"ID": "device-1", "Tags": ["tag:guest"]},
-    "TailscaleIPs": ["100.96.0.2"],
-}
+class ConfigurationTests(unittest.TestCase):
+    def test_guest_cannot_accept_new_connections(self):
+        cfg = tknet.nebula_config("guest")
+        self.assertEqual(cfg["firewall"]["inbound"], [])
+        self.assertEqual(cfg["firewall"]["outbound"], [{"port": "any", "proto": "any", "group": "host"}])
+
+    def test_hosts_accept_both_roles_but_cannot_initiate_to_guests(self):
+        cfg = tknet.nebula_config("host")
+        self.assertEqual([r["group"] for r in cfg["firewall"]["inbound"]], ["host", "guest"])
+        self.assertEqual([r["group"] for r in cfg["firewall"]["outbound"]], ["host"])
+
+    def test_no_dns_or_https_bootstrap(self):
+        cfg = tknet.nebula_config("guest")
+        self.assertEqual(cfg["static_host_map"], {"10.27.0.1": ["166.111.192.92:3478"]})
+        self.assertEqual(cfg["listen"]["so_mark"], 0x270000)
+        self.assertEqual(cfg["relay"]["relays"], ["10.27.0.1"])
+        server = tknet.nebula_config("host", True)
+        self.assertTrue(server["lighthouse"]["am_lighthouse"])
+        self.assertTrue(server["relay"]["am_relay"])
+        self.assertEqual(server["relay"]["relays"], [])
+
+    def test_encoded_invitation(self):
+        data = {"server": "166.111.192.92", "key": "a" * 1000}
+        encoded = "tk2_" + base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+        self.assertEqual(tknet.invitation_data(encoded), data)
+
+    def test_ssh_include_preserves_existing_configuration(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            ssh = root / "ssh"
+            ssh.mkdir()
+            original = "Host old\n    HostName 1.2.3.4\n"
+            (ssh / "config").write_text(original)
+            bundle = {"hosts": tknet.HOSTS, "ssh-user-cert.pub": "test", "ssh-host-ca.pub": "ssh-ed25519 test"}
+            for _ in range(2):
+                tknet.configure_ssh(bundle, root / "state", ssh)
+            self.assertEqual((ssh / "config").read_text().count("Include "), 1)
+            self.assertIn(original, (ssh / "config").read_text())
+            self.assertEqual((ssh / "config.before-tknet").read_text(), original)
+            resolved = tknet.run(["ssh", "-G", "-F", ssh / "config", "tkmain"])
+            self.assertIn("hostname 10.27.0.2\n", resolved)
+            self.assertIn("port 22\n", resolved)
 
 
-class JoinTests(unittest.TestCase):
+@unittest.skipUnless((tknet.BIN / "nebula-cert").exists(), "Nebula certificate tool is required")
+class AdmissionTests(unittest.TestCase):
     def setUp(self):
-        with patch("tknet.shutil.which", return_value="/usr/bin/tailscale"):
-            self.client = Client({"server_url": "https://hs.example.test"})
-        self.commands = []
-        self.key_path = None
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.patch = patch.object(admin, "ADMIN", self.root / "authority")
+        self.patch.start()
+        admin.initialize()
+        tknet.run([tknet.BIN / "nebula-cert", "keygen", "-out-key", self.root / "node.key", "-out-pub", self.root / "node.pub"])
+        tknet.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", self.root / "ssh"])
+        self.request = {"nebula_public": (self.root / "node.pub").read_text(), "ssh_public": (self.root / "ssh.pub").read_text()}
+        self.token = "a" * 32
+        self.directory = admin.ADMIN / "invitations" / self.token
+        self.directory.mkdir(parents=True)
+        tknet.write(self.directory / "record.json", json.dumps({"name": "test-guest", "address": "10.27.0.100/24", "expires": time.time() + 60}))
 
-    def fake_command(self, args, **kwargs):
-        self.commands.append(args)
-        if args == ["debug", "prefs"]:
-            return json.dumps({"ControlURL": self.client.server})
-        for arg in args:
-            if arg.startswith("--auth-key=file:"):
-                self.key_path = Path(arg.removeprefix("--auth-key=file:"))
-                self.assertEqual(self.key_path.read_text(), "test-invitation")
-                self.assertEqual(self.key_path.stat().st_mode & 0o777, 0o600)
-        self.assertNotIn("test-invitation", args)
-        return ""
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
 
-    def test_first_join_handles_null_self_and_removes_key_file(self):
-        with patch.object(self.client, "state", side_effect=[{"BackendState": "NeedsLogin", "Self": None}, RUNNING]), patch.object(self.client, "run", side_effect=self.fake_command), patch("tknet.socket.getaddrinfo"), patch("builtins.print"):
-            self.client.join("test-invitation")
-        self.assertFalse(self.key_path.exists())
-        self.assertIn("--shields-up=true", self.commands[0])
-        self.assertIn("--ssh=false", self.commands[0])
+    def test_enrollment_and_retry_use_same_certificates(self):
+        first = admin.enroll(self.token, self.request)
+        self.assertEqual(first, admin.enroll(self.token, self.request))
+        self.assertEqual(first["role"], "guest")
+        self.assertNotIn("node.key", first)
+        tknet.write(self.root / "user-cert.pub", first["ssh-user-cert.pub"])
+        info = tknet.run(["ssh-keygen", "-L", "-f", self.root / "user-cert.pub"])
+        self.assertIn("tinker", info)
+        tknet.write(self.root / "ca.crt", first["ca.crt"])
+        tknet.write(self.root / "node.crt", first["node.crt"])
+        tknet.run([tknet.BIN / "nebula-cert", "verify", "-ca", self.root / "ca.crt", "-crt", self.root / "node.crt"])
 
-    def test_repeat_join_reuses_identity_without_consuming_invitation(self):
-        with patch.object(self.client, "state", return_value=RUNNING), patch.object(self.client, "run", side_effect=self.fake_command), patch("builtins.print"):
-            self.client.join("used-invitation")
-        self.assertIsNone(self.key_path)
-        self.assertIn(["up", "--timeout=60s"], self.commands)
+    def test_used_invitation_cannot_enroll_different_keys(self):
+        admin.enroll(self.token, self.request)
+        with self.assertRaisesRegex(ValueError, "already used"):
+            admin.enroll(self.token, {**self.request, "ssh_public": "ssh-ed25519 other"})
 
-    def test_other_network_is_not_modified(self):
-        with patch.object(self.client, "state", return_value=RUNNING), patch.object(self.client, "run", return_value='{"ControlURL":"https://other.test"}') as command:
-            with self.assertRaisesRegex(RuntimeError, "another Tailscale profile"):
-                self.client.join("test-invitation")
-        command.assert_called_once_with(["debug", "prefs"])
-
-    def test_wrong_role_after_enrollment_disconnects(self):
-        wrong_role = {**RUNNING, "Self": {"ID": "device-1", "Tags": ["tag:host"]}}
-        with patch.object(self.client, "state", side_effect=[{"BackendState": "NeedsLogin"}, wrong_role]), patch.object(self.client, "run", side_effect=self.fake_command), patch("tknet.socket.getaddrinfo"):
-            with self.assertRaisesRegex(RuntimeError, "no guest role"):
-                self.client.join("test-invitation")
-        self.assertEqual(self.commands[-1], ["down"])
-        self.assertFalse(self.key_path.exists())
-
-    def test_failed_enrollment_removes_key_file(self):
-        def fail(args, **kwargs):
-            self.fake_command(args, **kwargs)
-            raise RuntimeError("Invitation expired")
-
-        with patch.object(self.client, "state", return_value={"BackendState": "NeedsLogin"}), patch.object(self.client, "run", side_effect=fail), patch("tknet.socket.getaddrinfo"):
-            with self.assertRaisesRegex(RuntimeError, "Invitation expired"):
-                self.client.join("test-invitation")
-        self.assertFalse(self.key_path.exists())
+    def test_expired_invitation_cannot_issue_membership(self):
+        record = json.loads((self.directory / "record.json").read_text())
+        record["expires"] = time.time() - 1
+        tknet.write(self.directory / "record.json", json.dumps(record))
+        with self.assertRaisesRegex(ValueError, "expired"):
+            admin.enroll(self.token, self.request)
 
 
 if __name__ == "__main__":

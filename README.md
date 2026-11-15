@@ -1,55 +1,68 @@
-# tknet guest client
+# tknet
 
-A Linux guest client for the TK mesh. It uses Python 3.9 or newer and the official Tailscale client.
+A self-hosted Linux mesh client. No public DNS record, HTTPS server, or public
+certificate authority is needed. Nebula connects directly over UDP when possible
+and uses tkserver as a relay when direct connectivity fails. Existing high-port
+SSH handles admission.
 
-## Install
+## Install and join
 
-```bash
+```sh
 curl -fsSL https://raw.githubusercontent.com/tinkerfuroc/tknet/main/install.sh | sh
+tknet join laptop-name.tknet
+ssh tinker@tkmain
 ```
 
-The installer puts `tknet` in `~/.local/bin` without sudo. Set `TKNET_INSTALL_DIR`
-in the installer's environment to choose a different directory. Run the same
-command to upgrade. If needed, add the installation directory to your `PATH`.
+Requires Linux with systemd, Python 3.9+, OpenSSH, curl, tar, iproute2, ping and
+sudo. The installer supports amd64 and arm64. It installs pinned Nebula 1.12.0
+binaries under /opt/tknet/bin and the client under ~/.local/bin. Software downloads
+use GitHub HTTPS; the running mesh has no HTTPS or public-DNS dependency.
 
-Joining requires the [official Tailscale client](https://tailscale.com/download/linux)
-and its running system service. The default Headscale endpoint is `https://hs.wkj24.top`.
-For another endpoint, use `tknet --config /path/to/config.json join`, or set
-`server_url` in `/etc/tknet/config.json`. See `config.json` for the file format.
+The guest receives a private invitation file from tkserver. Alternatively,
+`tknet join` prompts for a tk2 encoded invitation. Each invitation expires after
+24 hours and is bound to the first device's public keys. Lost-response retries
+with the same keys are allowed. Device private keys never leave the device.
 
-## Use
-
-```bash
-tknet join
+```sh
 tknet status
 tknet leave
 tknet join
 ```
 
-For first enrollment, `tknet join` prompts for the invitation
-without echoing it or placing it in shell history. An invitation is a Headscale
-one-use key issued with `tag:guest`. Once connected, use `ssh tinker@tkmain`.
+Leaving keeps the identity but disables mesh SSH overrides. Rejoining reuses it.
+The original SSH configuration is preserved and backed up before the first join.
+Friendly names are local SSH aliases; other applications can use mesh IPs.
 
-The client enables DNS, disables accepted subnet routes and its Tailscale SSH
-server, and enables shields-up for incoming connections. Existing authenticated
-TK guest profiles are reused on reconnect. `leave` disconnects while retaining
-the identity. Server-side revocation remains a Headscale administration operation.
+## Admission on tkserver
 
-First enrollment passes the invitation to Tailscale through a temporary mode-0600
-file which is removed on success or failure. The CLI checks assigned role and
-connectivity to tkserver before reporting success. A failed connectivity check
-can leave an enrolled client connected; inspect `tknet status` and retry after
-resolving the network problem. An interrupted enrollment may also have completed
-at the server, so inspect state before requesting another invitation.
+Run as tinker after the authority has been initialized:
 
-Administrative invitation generation is outside this client implementation.
-Install and service startup are handled by the official Tailscale package.
+```sh
+tknet invite laptop-name
+```
 
-## Offline validation
+Send laptop-name.tknet privately to that guest. It permits enrollment only,
+not an interactive server login. The device creates its own keys and receives
+Nebula membership and a user certificate restricted to the tinker SSH principal.
 
-```bash
+All hosts accept traffic from approved hosts and guests. No role may initiate
+new connections to a guest. The overlay SSH server accepts only tinker and
+trusts the tkserver SSH CA; no pairwise authorized_keys management is needed.
+The separate native recovery SSH configuration is preserved.
+
+## Current acceptance and limits
+
+The tkserver / tkmain / wkj-pi path has passed invitation redemption, join,
+SSH login, direct transport and forced relay tests. tkbox and tkmini are not yet
+enrolled in this version. Guest membership is currently valid for one year;
+automated renewal and operational revocation commands are pending. The existing
+FRP fallback remains available. UDP reachability is required even when relaying.
+
+## Development
+
+```sh
 python3 -m unittest -v test_tknet.py
 ```
 
-Tests substitute Tailscale responses and perform no network configuration.
-Live enrollment and SSH acceptance require the deployed Headscale service.
+Tests use real Nebula/OpenSSH certificate tools when installed, with temporary
+keys and files. They do not alter live network configuration.
