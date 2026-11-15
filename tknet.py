@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -Es
 """TK mesh: direct IP enrollment over SSH and encrypted Nebula networking."""
 
 import argparse
@@ -11,12 +11,16 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
+SYSTEM_PYTHON = ["/usr/bin/python3", "-Es"]
+TUN_NAME = "tktun"
 BIN = Path("/opt/tknet/bin")
 CONFIG = Path("/etc/tknet")
 STATE = Path.home() / ".local/share/tknet/client"
@@ -57,19 +61,32 @@ def valid_name(name):
 
 
 def invitation_key(seed):
-    """Serialize a bootstrap identity using the OpenSSH-compatible key format."""
-    try:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    except ImportError as error:
-        raise RuntimeError("Install python3-cryptography, or rerun the tknet installer") from error
-    private = Ed25519PrivateKey.from_private_bytes(seed)
-    private_text = private.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
-        serialization.NoEncryption()).decode("ascii")
-    public_text = private.public_key().public_bytes(
-        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH).decode("ascii")
-    return private_text, public_text
+    """Use system OpenSSL for Ed25519; encode the documented OpenSSH envelope."""
+    if len(seed) != 32:
+        raise ValueError("An Ed25519 seed must contain 32 bytes")
+    # RFC 8410 PKCS#8 private key and SubjectPublicKeyInfo encodings.
+    der = bytes.fromhex("302e020100300506032b657004220420") + seed
+    result = subprocess.run(["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+                            input=der, capture_output=True, timeout=10)
+    prefix = bytes.fromhex("302a300506032b6570032100")
+    if result.returncode or len(result.stdout) != 44 or not result.stdout.startswith(prefix):
+        raise RuntimeError("System OpenSSL could not derive an Ed25519 public key")
+    public = result.stdout[len(prefix):]
+
+    def field(value):
+        return struct.pack(">I", len(value)) + value
+
+    # OpenSSH PROTOCOL.key: an unencrypted key, repeated checkint and 8-byte padding.
+    public_blob = field(b"ssh-ed25519") + field(public)
+    check = os.urandom(4)
+    private_blob = check * 2 + public_blob + field(seed + public) + field(b"")
+    private_blob += bytes(range(1, (-len(private_blob) % 8) + 1))
+    envelope = (b"openssh-key-v1\0" + field(b"none") + field(b"none") + field(b"")
+                + struct.pack(">I", 1) + field(public_blob) + field(private_blob))
+    encoded = base64.b64encode(envelope).decode("ascii")
+    lines = "\n".join(encoded[i:i + 70] for i in range(0, len(encoded), 70))
+    return (f"-----BEGIN OPENSSH PRIVATE KEY-----\n{lines}\n-----END OPENSSH PRIVATE KEY-----\n",
+            "ssh-ed25519 " + base64.b64encode(public_blob).decode("ascii"))
 
 
 def nebula_config(role, lighthouse=False, config_dir=CONFIG):
@@ -87,7 +104,7 @@ def nebula_config(role, lighthouse=False, config_dir=CONFIG):
         "punchy": {"punch": True},
         "relay": {"am_relay": lighthouse, "use_relays": True,
                   "relays": [] if lighthouse else [SERVER]},
-        "tun": {"dev": "tknet0", "mtu": 1300},
+        "tun": {"dev": TUN_NAME, "mtu": 1300},
         "logging": {"level": "info", "format": "json"},
         "firewall": {"inbound": rules if role == "host" else [], "outbound": [rules[0]]},
     }
@@ -101,12 +118,10 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=-/usr/sbin/ip -4 rule add pref 8906 fwmark 0x270000 lookup main
-ExecStartPre=-/usr/sbin/ip -4 rule add pref 8907 to 10.27.0.0/24 lookup main
+ExecStartPre=/usr/bin/python3 -Es /opt/tknet/lib/tknet.py routes-up
 ExecStart=/opt/tknet/bin/nebula -config /etc/tknet/nebula.json
 ExecReload=/bin/kill -HUP $MAINPID
-ExecStopPost=-/usr/sbin/ip -4 rule del pref 8906 fwmark 0x270000 lookup main
-ExecStopPost=-/usr/sbin/ip -4 rule del pref 8907 to 10.27.0.0/24 lookup main
+ExecStopPost=/usr/bin/python3 -Es /opt/tknet/lib/tknet.py routes-down
 Restart=on-failure
 RestartSec=3
 
@@ -127,13 +142,120 @@ def write_network_config(bundle, directory):
     run([BIN / "nebula", "-test", "-config", directory / "nebula.json"])
 
 
+def netlink_rules(message_type, payload, flags):
+    """Exchange Linux rtnetlink rule messages without the iproute2 executable."""
+    results = []
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as sock:
+        sock.settimeout(5)
+        sock.bind((0, 0))
+        header = struct.pack("=IHHII", 16 + len(payload), message_type, flags | 1, 1, sock.getsockname()[0])
+        sock.sendto(header + payload, (0, 0))
+        while True:
+            data, _, received_flags, sender = sock.recvmsg(1024 * 1024)
+            if sender[0] != 0:
+                continue
+            if received_flags & socket.MSG_TRUNC:
+                raise RuntimeError("Truncated routing-rule response")
+            offset = 0
+            while offset + 16 <= len(data):
+                size, kind, reply_flags, sequence, _ = struct.unpack_from("=IHHII", data, offset)
+                if size < 16 or offset + size > len(data):
+                    raise RuntimeError("Invalid routing-rule response")
+                body = data[offset + 16:offset + size]
+                offset += (size + 3) & ~3
+                if sequence != 1:
+                    continue
+                if reply_flags & 0x10:
+                    raise RuntimeError("Routing rules changed while being read; retry")
+                if kind in (2, 3):  # NLMSG_ERROR (including ACK) or NLMSG_DONE.
+                    error = struct.unpack_from("=i", body)[0] if len(body) >= 4 else 0
+                    if error:
+                        raise OSError(-error, os.strerror(-error))
+                    return results
+                if kind == 32:  # RTM_NEWRULE.
+                    results.append(body)
+
+
+def rule_attributes(payload):
+    attrs = {}
+    offset = 12  # sizeof(struct fib_rule_hdr), linux/fib_rules.h.
+    while offset + 4 <= len(payload):
+        size, kind = struct.unpack_from("=HH", payload, offset)
+        if size < 4 or offset + size > len(payload):
+            raise RuntimeError("Invalid routing-rule attribute")
+        attrs[kind] = payload[offset + 4:offset + size]
+        offset += (size + 3) & ~3
+    return attrs
+
+
+def desired_rules():
+    def attribute(kind, value):
+        data = struct.pack("=HH", 4 + len(value), kind) + value
+        return data + b"\0" * (-len(data) % 4)
+
+    def header(prefix):
+        return struct.pack("=BBBBBBBBI", socket.AF_INET, prefix, 0, 0, 254, 0, 0, 1, 0)
+
+    return {
+        8906: header(0) + attribute(6, struct.pack("=I", 8906))
+              + attribute(10, struct.pack("=I", 0x270000))
+              + attribute(16, struct.pack("=I", 0xffffffff)),
+        8907: header(24) + attribute(6, struct.pack("=I", 8907))
+              + attribute(1, socket.inet_aton("10.27.0.0")),
+    }
+
+
+def list_route_rules():
+    return netlink_rules(34, struct.pack("=BBBBBBBBI", socket.AF_INET, 0, 0, 0, 0, 0, 0, 0, 0), 0x300)
+
+
+def same_rule(actual, expected):
+    attrs = rule_attributes(actual)
+    # Ignore only non-selecting metadata and the kernel's explicit defaults.
+    attrs.pop(21, None)  # FRA_PROTOCOL records the rule's origin.
+    for kind, neutral in ((15, 254), (13, 0xffffffff), (14, 0xffffffff)):
+        if attrs.get(kind) == struct.pack("=I", neutral):
+            attrs.pop(kind)
+    if 10 in attrs:
+        attrs.setdefault(16, struct.pack("=I", 0xffffffff))
+    return actual[:12] == expected[:12] and attrs == rule_attributes(expected)
+
+
 def check_route_rules():
-    for rule in json.loads(run(["ip", "-j", "-4", "rule"])):
-        priority = rule.get("priority")
-        if priority == 8906 and (rule.get("fwmark") != "0x270000" or rule.get("table") != "main"):
-            raise RuntimeError("Policy rule 8906 is occupied")
-        if priority == 8907 and (rule.get("dst") != NETWORK or rule.get("table") != "main"):
-            raise RuntimeError("Policy rule 8907 is occupied")
+    desired = desired_rules()
+    existing = set()
+    for payload in list_route_rules():
+        priority = struct.unpack("=I", rule_attributes(payload).get(6, b"\0" * 4))[0]
+        if priority in desired:
+            if priority in existing or not same_rule(payload, desired[priority]):
+                raise RuntimeError(f"Policy rule {priority} is occupied")
+            existing.add(priority)
+    return existing
+
+
+def routes_up():
+    existing = check_route_rules()
+    added = []
+    try:
+        for priority, payload in desired_rules().items():
+            if priority not in existing:
+                netlink_rules(32, payload, 0x604)  # ACK | CREATE | EXCL.
+                added.append(priority)
+        return added
+    except BaseException:
+        routes_down(added)
+        raise
+
+
+def routes_down(priorities=None):
+    desired = desired_rules()
+    selected = set(desired if priorities is None else priorities)
+    if not selected:
+        return
+    for payload in list_route_rules():
+        priority = struct.unpack("=I", rule_attributes(payload).get(6, b"\0" * 4))[0]
+        if priority in selected and same_rule(payload, desired[priority]):
+            netlink_rules(33, payload, 4)  # RTM_DELRULE | ACK.
 
 
 def install_network(bundle):
@@ -184,18 +306,12 @@ def client_run(bundle):
 
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
-        rules = [("8906", "fwmark", "0x270000"), ("8907", "to", NETWORK)]
         try:
-            if Path("/sys/class/net/tknet0").exists():
-                raise RuntimeError("tknet0 is already managed by another process")
+            if Path(f"/sys/class/net/{TUN_NAME}").exists():
+                raise RuntimeError(f"{TUN_NAME} is already managed by another process")
             directory = RUNTIME / "config"
             write_network_config(bundle, directory)
-            check_route_rules()
-            existing = {r.get("priority") for r in json.loads(run(["ip", "-j", "-4", "rule"]))}
-            for priority, kind, value in rules:
-                if int(priority) not in existing:
-                    run(["ip", "-4", "rule", "add", "pref", priority, kind, value, "lookup", "main"])
-                    added.append((priority, kind, value))
+            added = routes_up()
             if stopping:
                 return
             child = subprocess.Popen([str(BIN / "nebula"), "-config", str(directory / "nebula.json")],
@@ -204,11 +320,11 @@ def client_run(bundle):
             for _ in range(100):
                 if child.poll() is not None or stopping:
                     raise RuntimeError("Nebula exited during startup")
-                if Path("/sys/class/net/tknet0").exists():
+                if Path(f"/sys/class/net/{TUN_NAME}").exists():
                     break
                 time.sleep(0.05)
             else:
-                raise RuntimeError("Nebula did not create tknet0")
+                raise RuntimeError(f"Nebula did not create {TUN_NAME}")
             write(RUNTIME / "state.json", json.dumps({"pid": os.getpid(),
                   "start": process_start(os.getpid()), "address": bundle["address"]}), 0o644)
             child.wait()
@@ -220,9 +336,7 @@ def client_run(bundle):
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait()
-            for priority, kind, value in reversed(added):
-                subprocess.run(["ip", "-4", "rule", "del", "pref", priority,
-                                kind, value, "lookup", "main"], capture_output=True)
+            routes_down(added)
             (RUNTIME / "state.json").unlink(missing_ok=True)
             for name in ("node.key", "node.crt", "ca.crt", "nebula.json"):
                 (RUNTIME / "config" / name).unlink(missing_ok=True)
@@ -241,7 +355,7 @@ def client_start(bundle):
             print(json.dumps({"started": False}))
             return
         with CLIENT_LOG.open("a") as log:
-            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "client-run"],
+            child = subprocess.Popen([*SYSTEM_PYTHON, str(Path(__file__).resolve()), "client-run"],
                                      stdin=subprocess.PIPE, stdout=log, stderr=log,
                                      text=True, start_new_session=True)
             child.stdin.write(json.dumps(bundle))
@@ -398,7 +512,7 @@ def privileged(command, bundle=None):
     ready = subprocess.run(["sudo", "-n", "true"], capture_output=True)
     if ready.returncode:
         subprocess.run(["sudo", "-v"], check=True)
-    return run(["sudo", "-n", sys.executable, Path(__file__).resolve(), command],
+    return run(["sudo", "-n", *SYSTEM_PYTHON, Path(__file__).resolve(), command],
                input=json.dumps(bundle) if bundle is not None else None)
 
 
@@ -447,14 +561,14 @@ def main():
     invite.add_argument("name")
     commands.add_parser("install-network")
     commands.add_parser("install-host")
-    for command in ("client-start", "client-run", "client-stop"):
+    for command in ("client-start", "client-run", "client-stop", "routes-up", "routes-down"):
         commands.add_parser(command)
     args = parser.parse_args()
     try:
         if args.command == "up":
             up(args.invitation)
         elif args.command == "invite":
-            result = subprocess.run([sys.executable, "/opt/tknet/lib/admin.py", "invite", args.name])
+            result = subprocess.run([*SYSTEM_PYTHON, "/opt/tknet/lib/admin.py", "invite", args.name])
             return result.returncode
         elif args.command.startswith("install-"):
             bundle = json.loads(sys.stdin.read(131072))
@@ -463,13 +577,16 @@ def main():
             down()
         elif args.command == "client-stop":
             client_stop()
+        elif args.command in ("routes-up", "routes-down"):
+            (routes_up if args.command == "routes-up" else routes_down)()
         elif args.command in ("client-start", "client-run"):
             bundle = json.loads(sys.stdin.read(131072))
             (client_start if args.command == "client-start" else client_run)(bundle)
         else:
             state = client_state()
             print(f"Connected: {state['address']} (PID {state['pid']})" if state else "Client disconnected")
-            subprocess.run(["ip", "-br", "address", "show", "tknet0"], check=False)
+            if Path(f"/sys/class/net/{TUN_NAME}").exists():
+                print(f"Interface: {TUN_NAME}")
         return 0
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"tknet: {error}", file=sys.stderr)

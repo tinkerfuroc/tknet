@@ -5,6 +5,7 @@ from contextlib import ExitStack
 import json
 from pathlib import Path
 import subprocess
+import struct
 import tempfile
 import time
 import unittest
@@ -15,8 +16,15 @@ import tknet
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_openssl_seed_matches_rfc8032_vector(self):
+        seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+        _, public = tknet.invitation_key(seed)
+        raw = base64.b64decode(public.split()[1])[-32:]
+        self.assertEqual(raw.hex(), "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+
     def test_guest_cannot_accept_new_connections(self):
         cfg = tknet.nebula_config("guest")
+        self.assertEqual(cfg["tun"]["dev"], "tktun")
         self.assertEqual(cfg["firewall"]["inbound"], [])
         self.assertEqual(cfg["firewall"]["outbound"], [{"port": "any", "proto": "any", "group": "host"}])
 
@@ -112,6 +120,30 @@ class ClientLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Guest clients"):
                 tknet.install_network({"role": "guest"})
             run.assert_not_called()
+
+
+class RouteTests(unittest.TestCase):
+    def test_same_priority_with_extra_selector_is_rejected(self):
+        desired = tknet.desired_rules()[8906]
+        extra = struct.pack("=HH4s", 8, 2, bytes([10, 0, 0, 1]))
+        self.assertFalse(tknet.same_rule(desired + extra, desired))
+        with patch("tknet.list_route_rules", return_value=[desired + extra]):
+            with self.assertRaisesRegex(RuntimeError, "occupied"):
+                tknet.check_route_rules()
+
+    def test_partial_add_failure_rolls_back(self):
+        calls = []
+
+        def exchange(kind, payload, flags):
+            calls.append(kind)
+            if len(calls) == 2:
+                raise OSError("simulated failure")
+            return []
+
+        with patch("tknet.check_route_rules", return_value=set()), patch("tknet.netlink_rules", side_effect=exchange), patch("tknet.list_route_rules", return_value=[tknet.desired_rules()[8906]]):
+            with self.assertRaisesRegex(OSError, "simulated failure"):
+                tknet.routes_up()
+        self.assertEqual(calls, [32, 32, 33])
 
 
 @unittest.skipUnless((tknet.BIN / "nebula-cert").exists(), "Nebula certificate tool is required")

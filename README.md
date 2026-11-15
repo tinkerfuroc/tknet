@@ -13,10 +13,17 @@ tknet up <invitation-code>
 ssh tinker@tkmain
 ```
 
-Requires Linux, Python 3.9+, Python cryptography, OpenSSH, curl, tar,
-iproute2, ping and sudo. On Debian/Ubuntu, the installer installs the cryptography
-package if missing. The installer supports amd64 and arm64. It installs pinned Nebula 1.12.0
-binaries under /opt/tknet/bin and the client under ~/.local/bin. Software downloads
+Requires Linux with TUN support, system Python 3.9+ at `/usr/bin/python3`,
+OpenSSH, system OpenSSL, ping and sudo. Python uses only its standard library;
+there is no pip, venv, cryptography or iproute2 dependency. Route rules use the
+Linux rtnetlink interface directly. The virtual interface is named `tktun`.
+
+Installation also uses curl and tar. The installer supports amd64 and arm64.
+It downloads pinned Nebula 1.12.0 from the official `slackhq/nebula` GitHub
+release, selects the matching architecture, and extracts `nebula` and
+`nebula-cert` into `/opt/tknet/bin`. If both binaries already exist and the
+Nebula version matches, it skips this download. The CLI is installed under
+`~/.local/bin` and the administrative library under `/opt/tknet/lib`. Software downloads
 use GitHub HTTPS; the running mesh has no HTTPS or public-DNS dependency.
 
 The guest receives a 47-character invitation code beginning with `tk3_`.
@@ -83,16 +90,17 @@ enrolled in this version. Guest membership is currently valid for one year;
 automated renewal and operational revocation commands are pending. The existing
 FRP fallback remains available. UDP reachability is required even when relaying.
 
-The v0.2.1 code flow was separately verified against tkserver with an isolated
+The invitation-code flow was separately verified against tkserver with an isolated
 temporary identity: redemption, signed SSH login to tkmain, same-key retry, and
 rejection of different-device replay and expired codes. This test preserved the existing network
-service and device keys. The 47-character encoding uses the established
-[Ed25519 serialization API](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519/).
+service and device keys. The 47-character code is unchanged. System OpenSSL
+derives the Ed25519 public key; Python serializes the documented
+[OpenSSH key envelope](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key).
 
 ## Development
 
 ```sh
-python3 -m unittest -v test_tknet.py
+/usr/bin/python3 -S -m unittest -v test_tknet.py
 ```
 
 Tests use real Nebula/OpenSSH certificate tools when installed, with temporary

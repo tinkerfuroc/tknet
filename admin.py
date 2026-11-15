@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -Es
 """TK admission authority. Run as tinker on tkserver."""
 
 import argparse
@@ -91,7 +91,7 @@ def invite(name):
         expiry = time.strftime("%Y%m%d%H%M%S", time.localtime(expires))
         authorized = Path.home() / ".ssh/authorized_keys"
         previous = authorized.read_text() if authorized.exists() else ""
-        line = f'restrict,expiry-time="{expiry}",command="/usr/bin/python3 {authority} enroll {token}" {key}\n'
+        line = f'restrict,expiry-time="{expiry}",command="/usr/bin/python3 -Es {authority} enroll {token}" {key}\n'
         write(authorized, previous.rstrip("\n") + "\n" + line)
         return code
 
