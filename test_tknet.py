@@ -39,6 +39,27 @@ class ConfigurationTests(unittest.TestCase):
         encoded = "tk2_" + base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
         self.assertEqual(tknet.invitation_data(encoded), data)
 
+    def test_invalid_codes_fail_before_network_access(self):
+        for value in ("tk3_", "tk3_" + "a" * 63, "tk3_" + "!" * 64, "a" * 1024):
+            with self.subTest(value_length=len(value)), self.assertRaises(ValueError):
+                tknet.invitation_data(value)
+
+    def test_enrollment_reuses_existing_private_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            originals = {"node.key": "network-key", "id_ed25519": "ssh-key",
+                         "node.pub": "network-public", "id_ed25519.pub": "ssh-public"}
+            for name, text in originals.items():
+                tknet.write(state / name, text)
+            invite = {"server": tknet.ENROLLMENT_SERVER, "port": tknet.ENROLLMENT_PORT,
+                      "host_key": tknet.ENROLLMENT_HOST_KEY, "key": "bootstrap-key"}
+            with patch("tknet.run", return_value=json.dumps({"role": "guest"})) as run:
+                tknet.enrollment(invite, state)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][0], "ssh")
+            for name, text in originals.items():
+                self.assertEqual((state / name).read_text(), text)
+
     def test_ssh_include_preserves_existing_configuration(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -100,6 +121,32 @@ class AdmissionTests(unittest.TestCase):
         tknet.write(self.directory / "record.json", json.dumps(record))
         with self.assertRaisesRegex(ValueError, "expired"):
             admin.enroll(self.token, self.request)
+
+    def test_code_matches_restricted_ssh_key_without_invitation_file(self):
+        host_key = self.root / "host.pub"
+        host_key.write_text(tknet.ENROLLMENT_HOST_KEY + " test-host\n")
+        ssh = self.root / ".ssh"
+        ssh.mkdir()
+        original = "ssh-ed25519 existing-key\n"
+        (ssh / "authorized_keys").write_text(original)
+        with patch.object(admin, "SERVER_HOST_KEY_FILE", host_key), patch("admin.Path.home", return_value=self.root):
+            code = admin.invite("code-guest")
+        self.assertEqual(len(code), 47)
+        invite = tknet.invitation_data(code)
+        tknet.write(self.root / "reconstructed.pem", invite["key"])
+        public_key = tknet.run(["ssh-keygen", "-y", "-f", self.root / "reconstructed.pem"]).strip()
+        authorized = (ssh / "authorized_keys").read_text()
+        self.assertTrue(authorized.startswith(original))
+        self.assertIn(public_key, authorized)
+        self.assertIn("restrict,expiry-time=", authorized)
+        self.assertIn("admin.py enroll ", authorized)
+        self.assertEqual(invite["server"], tknet.ENROLLMENT_SERVER)
+        self.assertEqual(invite["host_key"], tknet.ENROLLMENT_HOST_KEY)
+        self.assertFalse(list(admin.ADMIN.glob("bootstrap-*")))
+        self.assertFalse(list(self.root.rglob("*.tknet")))
+        records = [json.loads(p.read_text()) for p in admin.ADMIN.glob("invitations/*/record.json")]
+        record = next(r for r in records if r["name"] == "code-guest")
+        self.assertAlmostEqual(record["expires"] - time.time(), 86400, delta=3)
 
 
 if __name__ == "__main__":

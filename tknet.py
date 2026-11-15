@@ -14,13 +14,18 @@ import sys
 import tempfile
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 BIN = Path("/opt/tknet/bin")
 CONFIG = Path("/etc/tknet")
 STATE = Path.home() / ".local/share/tknet/client"
 NETWORK = "10.27.0.0/24"
 SERVER = "10.27.0.1"
 HOSTS = {"tkserver": SERVER, "tkmain": "10.27.0.2"}
+ENROLLMENT_SERVER = "166.111.192.92"
+ENROLLMENT_PORT = 12002
+ENROLLMENT_HOST_KEY = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExLLSHxjV/IoCbPG8vMowC0sArXXxFLKEYmMmKCu6rR"
+)
 
 
 def run(args, **kwargs):
@@ -45,6 +50,22 @@ def valid_name(name):
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", name):
         raise ValueError("Invalid device name")
     return name
+
+
+def invitation_key(seed):
+    """Serialize a bootstrap identity using the OpenSSH-compatible key format."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except ImportError as error:
+        raise RuntimeError("Install python3-cryptography, or rerun the tknet installer") from error
+    private = Ed25519PrivateKey.from_private_bytes(seed)
+    private_text = private.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
+        serialization.NoEncryption()).decode("ascii")
+    public_text = private.public_key().public_bytes(
+        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH).decode("ascii")
+    return private_text, public_text
 
 
 def nebula_config(role, lighthouse=False):
@@ -161,10 +182,21 @@ WantedBy=tknet.service
 
 
 def invitation_data(value):
-    if not value.startswith("tk2_") and Path(value).is_file():
+    value = value.strip()
+    if value.startswith("tk3_"):
+        encoded = value[4:]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", encoded):
+            raise ValueError("Invalid invitation code")
+        seed = base64.b64decode(encoded + "=", altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(seed).decode("ascii").rstrip("=") != encoded:
+            raise ValueError("Invalid invitation code")
+        return {"server": ENROLLMENT_SERVER, "port": ENROLLMENT_PORT,
+                "host_key": ENROLLMENT_HOST_KEY,
+                "key": invitation_key(seed)[0]}
+    if not value.startswith("tk2_") and len(value) <= 240 and Path(value).is_file():
         return json.loads(Path(value).read_text())
     if not value.startswith("tk2_"):
-        raise ValueError("Expected a tk2 invitation or invitation file")
+        raise ValueError("Expected a tk3 invitation code")
     return json.loads(base64.urlsafe_b64decode(value[4:] + "=" * (-len(value[4:]) % 4)))
 
 
@@ -172,7 +204,7 @@ def enrollment(invite, state):
     ipaddress.IPv4Address(invite["server"])
     if not isinstance(invite["port"], int) or not 1024 <= invite["port"] <= 65535:
         raise ValueError("Invalid enrollment port")
-    if invite["expires"] <= time.time():
+    if "expires" in invite and invite["expires"] <= time.time():
         raise ValueError("Invitation expired")
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not (state / "node.key").exists():
@@ -254,7 +286,6 @@ def main():
     commands.add_parser("status")
     invite = commands.add_parser("invite", help="Approve a guest on tkserver")
     invite.add_argument("name")
-    invite.add_argument("--output", type=Path)
     commands.add_parser("install-network", help=argparse.SUPPRESS)
     commands.add_parser("install-host", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -262,9 +293,8 @@ def main():
         if args.command == "join":
             join(args.invitation)
         elif args.command == "invite":
-            output = args.output or Path.cwd() / (valid_name(args.name) + ".tknet")
-            print(run([sys.executable, "/opt/tknet/lib/admin.py", "invite", args.name,
-                       "--output", output]), end="")
+            result = subprocess.run([sys.executable, "/opt/tknet/lib/admin.py", "invite", args.name])
+            return result.returncode
         elif args.command.startswith("install-"):
             bundle = json.loads(sys.stdin.read(131072))
             (install_host if args.command == "install-host" else install_network)(bundle)

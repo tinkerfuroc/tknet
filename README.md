@@ -9,19 +9,24 @@ SSH handles admission.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tinkerfuroc/tknet/main/install.sh | sh
-tknet join laptop-name.tknet
+tknet join <invitation-code>
 ssh tinker@tkmain
 ```
 
-Requires Linux with systemd, Python 3.9+, OpenSSH, curl, tar, iproute2, ping and
-sudo. The installer supports amd64 and arm64. It installs pinned Nebula 1.12.0
+Requires Linux with systemd, Python 3.9+, Python cryptography, OpenSSH, curl, tar,
+iproute2, ping and sudo. On Debian/Ubuntu, the installer installs the cryptography
+package if missing. The installer supports amd64 and arm64. It installs pinned Nebula 1.12.0
 binaries under /opt/tknet/bin and the client under ~/.local/bin. Software downloads
 use GitHub HTTPS; the running mesh has no HTTPS or public-DNS dependency.
 
-The guest receives a private invitation file from tkserver. Alternatively,
-`tknet join` prompts for a tk2 encoded invitation. Each invitation expires after
+The guest receives a 47-character invitation code beginning with `tk3_`.
+`tknet join` can also prompt for the code without echoing it. Each code expires after
 24 hours and is bound to the first device's public keys. Lost-response retries
-with the same keys are allowed. Device private keys never leave the device.
+with the same keys are allowed. Permanent device private keys never leave the
+device and existing keys are reused. Server IP, port, and the existing SSH host
+public key ship with the client, so they do not need to be copied with each code.
+The code is a restricted bootstrap credential, not a general SSH login key.
+Earlier invitation files and tk2 encodings remain readable for compatibility.
 
 ```sh
 tknet status
@@ -41,7 +46,8 @@ Run as tinker after the authority has been initialized:
 tknet invite laptop-name
 ```
 
-Send laptop-name.tknet privately to that guest. It permits enrollment only,
+The command prints the code to stdout and its 24-hour validity to stderr.
+Send the code privately to that guest. It permits enrollment only,
 not an interactive server login. The device creates its own keys and receives
 Nebula membership and a user certificate restricted to the tinker SSH principal.
 
@@ -57,6 +63,12 @@ SSH login, direct transport and forced relay tests. tkbox and tkmini are not yet
 enrolled in this version. Guest membership is currently valid for one year;
 automated renewal and operational revocation commands are pending. The existing
 FRP fallback remains available. UDP reachability is required even when relaying.
+
+The v0.2.1 code flow was separately verified against tkserver with an isolated
+temporary identity: redemption, signed SSH login to tkmain, same-key retry, and
+rejection of different-device replay and expired codes. This test preserved the existing network
+service and device keys. The 47-character encoding uses the established
+[Ed25519 serialization API](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519/).
 
 ## Development
 

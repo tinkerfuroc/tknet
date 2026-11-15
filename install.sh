@@ -2,7 +2,7 @@
 set -eu
 
 main() {
-    version=v0.2.0
+    version=v0.2.1
     nebula_version=v1.12.0
     asset="https://raw.githubusercontent.com/tinkerfuroc/tknet/$version/tknet.py"
 
@@ -13,6 +13,15 @@ main() {
     if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
         printf '%s\n' 'Install Python 3.9 or newer before installing tknet.' >&2
         exit 1
+    fi
+    if ! python3 -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey' 2>/dev/null; then
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y python3-cryptography
+        else
+            printf '%s\n' 'Install the Python cryptography package, then rerun this installer.' >&2
+            exit 1
+        fi
     fi
 
     install_dir=${TKNET_INSTALL_DIR:-"$HOME/.local/bin"}

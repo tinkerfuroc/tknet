@@ -2,6 +2,7 @@
 """TK admission authority. Run as tinker on tkserver."""
 
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -11,9 +12,10 @@ import sys
 import tempfile
 import time
 
-from tknet import BIN, HOSTS, run, valid_name, write
+from tknet import BIN, ENROLLMENT_HOST_KEY, HOSTS, invitation_key, run, valid_name, write
 
 ADMIN = Path.home() / ".local/share/tknet/admin"
+SERVER_HOST_KEY_FILE = Path("/etc/ssh/ssh_host_ed25519_key.pub")
 
 
 def initialize():
@@ -60,10 +62,12 @@ def issue_host(name, request):
         return bundle
 
 
-def invite(name, output):
+def invite(name):
     valid_name(name)
     if name in HOSTS:
         raise ValueError("This name is reserved for a host")
+    if " ".join(SERVER_HOST_KEY_FILE.read_text().split()[:2]) != ENROLLMENT_HOST_KEY:
+        raise ValueError("Server SSH identity differs from the client configuration")
     invitations = ADMIN / "invitations"
     invitations.mkdir(exist_ok=True, mode=0o700)
     with (ADMIN / "lock").open("a") as lock:
@@ -75,25 +79,21 @@ def invite(name, output):
         address = next((f"10.27.0.{i}/24" for i in range(100, 250) if f"10.27.0.{i}/24" not in used), None)
         if not address:
             raise ValueError("Guest address pool exhausted")
+        seed = secrets.token_bytes(32)
+        code = "tk3_" + base64.urlsafe_b64encode(seed).decode("ascii").rstrip("=")
+        key = invitation_key(seed)[1]
         token = secrets.token_hex(16)
         directory = invitations / token
         directory.mkdir(mode=0o700)
         expires = int(time.time()) + 86400
         write(directory / "record.json", json.dumps({"name": name, "address": address, "expires": expires}))
-        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", directory / "bootstrap"])
         authority = Path(__file__).resolve()
         expiry = time.strftime("%Y%m%d%H%M%S", time.localtime(expires))
-        key = (directory / "bootstrap.pub").read_text().strip()
         authorized = Path.home() / ".ssh/authorized_keys"
         previous = authorized.read_text() if authorized.exists() else ""
         line = f'restrict,expiry-time="{expiry}",command="/usr/bin/python3 {authority} enroll {token}" {key}\n'
         write(authorized, previous.rstrip("\n") + "\n" + line)
-        data = {"server": "166.111.192.92", "port": 12002, "expires": expires,
-                "key": (directory / "bootstrap").read_text(),
-                "host_key": Path("/etc/ssh/ssh_host_ed25519_key.pub").read_text().strip()}
-        write(output, json.dumps(data))
-        (directory / "bootstrap").unlink()
-        print(f"Invitation written to {output}; expires in 24 hours.")
+        return code
 
 
 def enroll(token, request):
@@ -124,7 +124,6 @@ def main():
     commands.add_parser("init")
     invite_parser = commands.add_parser("invite")
     invite_parser.add_argument("name")
-    invite_parser.add_argument("--output", type=Path, required=True)
     commands.add_parser("enroll").add_argument("token")
     commands.add_parser("issue-host").add_argument("name")
     args = parser.parse_args()
@@ -133,7 +132,8 @@ def main():
         if args.command == "init":
             initialize()
         elif args.command == "invite":
-            invite(args.name, args.output)
+            print(invite(args.name))
+            print("Expires in 24 hours; bound to the first device that redeems it.", file=sys.stderr)
         else:
             request = json.loads(sys.stdin.read(16384))
             response = enroll(args.token, request) if args.command == "enroll" else issue_host(args.name, request)
