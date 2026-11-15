@@ -66,6 +66,84 @@ class InstallationRoleTests(unittest.TestCase):
             with patch("tknet.os.geteuid", return_value=1000), patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
                 tknet.command_parser(["client-run"]).parse_args(["client-run"])
 
+    def test_host_commands_exclude_network_controls_and_payload_submission(self):
+        for server in (False, True):
+            with patch("tknet.host_installation", return_value=True), patch("tknet.server_installation", return_value=server):
+                help_text = tknet.command_parser([]).format_help()
+                self.assertNotIn("up", help_text)
+                self.assertNotIn("down", help_text)
+                for command in ("up", "down", "apply-policy", "install-renewal", "accept-renewal"):
+                    with patch("tknet.os.geteuid", return_value=0), patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+                        tknet.command_parser([command]).parse_args([command])
+
+    def test_guest_keeps_on_demand_commands(self):
+        with patch("tknet.host_installation", return_value=False), patch("tknet.server_installation", return_value=False):
+            for command in ("up", "down", "status"):
+                self.assertEqual(tknet.command_parser([command]).parse_args([command]).command, command)
+
+
+class HostSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.public = self.root / "public"
+        self.bundle = {"name": "tkmini", "node.crt": "certificate", "ssh-host-cert.pub": "host cert",
+                       "ssh-user-cert.pub": "user cert", "policy": {"version": 3, "fingerprints": [], "ssh_keys": []}}
+        for name, value in (("member.json", json.dumps(self.bundle)), ("policy.json", json.dumps(self.bundle["policy"])),
+                            ("nebula.json", json.dumps({"pki": {"blocklist": []}})),
+                            ("node.crt", "certificate"), ("ssh-host-cert.pub", "host cert")):
+            tknet.write(self.root / name, value)
+        self.stack = ExitStack()
+        self.stack.enter_context(patch("tknet.CONFIG", self.root))
+        self.stack.enter_context(patch("tknet.PUBLIC_STATE", self.public))
+        self.stack.enter_context(patch("tknet.os.geteuid", return_value=0))
+        self.fetch = self.stack.enter_context(patch("tknet.fetch_refresh", return_value=self.bundle))
+        self.run = self.stack.enter_context(patch("tknet.run"))
+        self.apply = self.stack.enter_context(patch("tknet.apply_policy"))
+        self.stack.enter_context(patch("tknet.certificate_info", return_value={"fingerprint": "fp"}))
+
+    def tearDown(self):
+        self.stack.close()
+        self.tmp.cleanup()
+
+    def test_unchanged_refresh_acknowledges_without_service_reload(self):
+        tknet.write(self.public / "sync.json", json.dumps({"policy_version": 3, "certificate_fingerprint": "fp"}))
+        tknet.host_sync()
+        self.fetch.assert_called_once_with(self.bundle, self.root / "identity")
+        self.apply.assert_not_called()
+        self.run.assert_not_called()
+        self.assertEqual(json.loads((self.public / "sync.json").read_text())["policy_version"], 3)
+
+    def test_reload_failure_is_retried_before_acknowledging(self):
+        self.run.side_effect = RuntimeError("reload failed")
+        with self.assertRaisesRegex(RuntimeError, "reload failed"):
+            tknet.host_sync()
+        self.assertFalse((self.public / "sync.json").exists())
+        self.run.side_effect = None
+        tknet.host_sync()
+        self.assertTrue((self.public / "sync.json").exists())
+
+    def test_authority_recovers_accidentally_inflated_local_version(self):
+        tknet.write(self.root / "policy.json", json.dumps({"version": 999999}))
+        tknet.host_sync()
+        self.apply.assert_called_once_with(self.bundle["policy"], directory=self.root, reload=False, authoritative=True)
+
+    def test_failed_fetch_keeps_installed_policy_and_has_no_acknowledgement(self):
+        self.fetch.side_effect = RuntimeError("authority unavailable")
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            tknet.host_sync()
+        self.apply.assert_not_called()
+        self.run.assert_not_called()
+        self.assertFalse((self.public / "sync.json").exists())
+
+    def test_changed_certificate_installs_once_and_reloads(self):
+        self.fetch.return_value = {**self.bundle, "node.crt": "renewed"}
+        with patch("tknet.install_renewal") as renewal:
+            tknet.host_sync()
+        self.assertEqual(renewal.call_args.kwargs, {"reload": False})
+        self.assertNotIn("policy", renewal.call_args.args[0])
+        self.assertEqual(self.run.call_count, 2)
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_openssl_seed_matches_rfc8032_vector(self):
@@ -346,7 +424,7 @@ class AdmissionTests(unittest.TestCase):
             admin.enroll(self.token, self.request)
 
     def test_failed_policy_delivery_is_reported(self):
-        with patch("admin.run", side_effect=RuntimeError("unreachable")):
+        with patch("admin.DELIVERY_TIMEOUT", 0), patch("admin.run", side_effect=RuntimeError("unreachable")):
             result = admin.synchronize_policy(admin.policy_snapshot())
         self.assertTrue(all(value.startswith("pending:") for value in result.values()))
 

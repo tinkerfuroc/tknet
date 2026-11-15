@@ -72,9 +72,10 @@ The v0.3 CLI uses `up` and `down` in place of `join` and `leave`.
 
 ## Admission on tkserver
 
-The same source supports two installation roles. The default client has only
-`up`, `down` and `status`; it does not install the management module. Install
-the server role on tkserver with:
+The same source supports two installation roles. The client does not install
+the management module. A guest exposes `up`, `down` and `status`; an enrolled
+host exposes only `status`. tkserver exposes `status`, `invite`, `list`,
+`revoke` and `renew`. Install the server role on tkserver with:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tinkerfuroc/tknet/main/install.sh | sh -s -- --server
@@ -83,8 +84,18 @@ curl -fsSL https://raw.githubusercontent.com/tinkerfuroc/tknet/main/install.sh |
 An ordinary upgrade preserves the installed role. `--client` explicitly
 selects the client role and removes a previously installed management module.
 Installation role is separate from Nebula membership: tkmain, tkbox and tkmini
-are network hosts but use the client CLI. Internal root helpers are not shown
-as user commands. Guests still need no systemd service.
+are network hosts but use the client installation. `/opt/tknet/membership`
+records host membership. All host network start/stop operations use systemd:
+
+```sh
+sudo systemctl start tknet
+sudo systemctl stop tknet
+systemctl status tknet
+```
+
+The mesh SSH service and policy timer follow the network service. Stopping
+the network also stops the timer; policy refresh never starts a stopped network.
+Guests still need no systemd service.
 
 Run management commands as tinker on tkserver after authority initialization:
 
@@ -105,21 +116,25 @@ Nebula membership and a user certificate restricted to the tinker SSH principal.
 `list` shows admission records, not online status. It hides revoked devices
 unless `-a` or `--all` is given; the same rule applies to `--json` output.
 `renew` issues another year
-using the existing device public keys, address and role. Online hosts receive
-their certificates immediately. Connected v0.4 guests refresh certificates
+using the existing device public keys, address and role. Host services pull
+certificates every 30 seconds. The management command waits up to 45 seconds
+for application receipts and reports unavailable hosts as pending. Connected
+v0.4+ guests refresh certificates
 and policy through the existing native SSH endpoint every 30 seconds; allow
 up to 60 seconds while the authority is reachable. Disconnected clients fetch
 them at the next `tknet up`. The restricted refresh key remains usable after
 certificate expiry, but can only retrieve that device's records, not a shell.
-An offline host can fetch its renewed certificates with `tknet up` too.
+A host refreshes on the next service start or timer tick after connectivity
+returns; no manual local policy submission is needed.
 
 `revoke` cancels unredeemed invitations, refuses future renewal/refresh, and
 blocks all recorded Nebula certificate versions plus the device's SSH public
-key. It distributes a full Nebula blocklist and OpenSSH KRL to every remaining
-host. Nebula tears down blocked tunnels. If any host cannot be updated, the
+key. Every remaining host pulls the full policy and builds its Nebula blocklist
+and OpenSSH KRL locally. Nebula tears down blocked tunnels. If any host cannot be updated, the
 command reports it as `pending` and returns nonzero; that host has not yet
 enforced the revocation. Run the same revoke command again after connectivity
-is restored. It is idempotent. Guest policy refresh requires v0.4 clients.
+is restored to confirm application; host timers already retry automatically.
+The command is idempotent. Guest policy refresh requires v0.4 clients.
 Revoking tkserver itself is not supported. Native personal recovery SSH keys
 are outside mesh membership and are not removed.
 
@@ -127,6 +142,17 @@ The operator accepts that anyone able to log in as tinker on tkserver can
 manage admission. This is an installation-role split, not a separate human
 administrator privilege model. Device private keys remain on each device;
 authority records and refresh responses contain only public credentials.
+
+All policy changes originate on tkserver. Each host's root-owned
+`tknet-sync.service` fetches its own records from the fixed native SSH endpoint,
+using the existing pinned server host key. It accepts no caller-provided JSON.
+The old `tknet-management` sudoers rule and local apply-policy/install-renewal
+commands are removed. This is centralized configuration management to prevent
+accidental divergence among trusted operators, not a new human permission model.
+Public application receipts and renewed outbound SSH certificates live under
+`/opt/tknet/public`; the refresh identity and installed configuration live under
+`/etc/tknet`. Keys and device addresses are preserved on upgrade. If the authority
+is unavailable, installed configuration remains in use and the timer retries.
 
 All hosts accept traffic from approved hosts and guests. No role may initiate
 new connections to a guest. The overlay SSH server accepts only tinker and
@@ -162,6 +188,15 @@ rejection of different-device replay and expired codes. This test preserved the 
 service and device keys. The 47-character code is unchanged. System OpenSSL
 derives the Ed25519 public key; Python serializes the documented
 [OpenSSH key envelope](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key).
+
+Version v0.5.0 passed 39 offline tests and deployment on all four hosts.
+The central pull path applied a new test revocation snapshot (version 4) on
+all hosts, retaining the four existing blocked certificate fingerprints and
+three revoked SSH keys. tkmini renewal was applied automatically and SSH still
+worked. Stopping tkmini through systemd kept the network, SSH service and timer
+inactive beyond one refresh interval; starting restored all three. Normal guest
+SSH and tkmain HTTP continued working. No supported host CLI accepts up/down
+or caller-supplied policy/renewal payloads.
 
 ## Development
 

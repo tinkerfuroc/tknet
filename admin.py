@@ -10,13 +10,15 @@ from pathlib import Path
 import secrets
 import sys
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import time
 
-from tknet import BIN, ENROLLMENT_HOST_KEY, HOSTS, SYSTEM_PYTHON, certificate_info, invitation_key, run, valid_name, write
+from tknet import BIN, ENROLLMENT_HOST_KEY, HOSTS, certificate_info, invitation_key, run, valid_name, write
 
 ADMIN = Path.home() / ".local/share/tknet/admin"
 SERVER_HOST_KEY_FILE = Path("/etc/ssh/ssh_host_ed25519_key.pub")
+DELIVERY_TIMEOUT = 45
 
 
 def initialize():
@@ -192,19 +194,38 @@ def refresh(token):
     return bundle
 
 
+def delivery_status(name, expected):
+    try:
+        path = "/opt/tknet/public/sync.json"
+        if name == "tkserver":
+            acknowledgement = json.loads(Path(path).read_text())
+        else:
+            acknowledgement = json.loads(run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                                               name, "cat", path], timeout=5))
+        if acknowledgement.get("name") == name and all(acknowledgement.get(k) == v for k, v in expected.items()):
+            return "applied"
+        return "pending: waiting for the host sync service"
+    except (RuntimeError, ValueError, subprocess.SubprocessError, OSError) as error:
+        return "pending: " + str(error)
+
+
+def wait_for_hosts(expected):
+    deadline = time.monotonic() + DELIVERY_TIMEOUT
+    results = {name: "pending" for name in expected}
+    while results:
+        pending = [name for name, state in results.items() if state != "applied"]
+        with ThreadPoolExecutor(max_workers=max(1, len(pending))) as executor:
+            replies = executor.map(lambda name: delivery_status(name, expected[name]), pending)
+            results.update(zip(pending, replies))
+        if all(value == "applied" for value in results.values()) or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    return results
+
+
 def synchronize_policy(policy):
-    results = {}
-    command = ["sudo", "-n", *SYSTEM_PYTHON, "/opt/tknet/lib/tknet.py", "apply-policy"]
-    # Apply the authority last, so revoking the operator does not interrupt other updates.
-    for name in [n for n in HOSTS if n != "tkserver"] + ["tkserver"]:
-        if name in policy["revoked_names"]:
-            continue
-        argv = command if name == "tkserver" else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", name, *command]
-        try:
-            run(argv, input=json.dumps(policy), timeout=15)
-            results[name] = "applied"
-        except (RuntimeError, subprocess.SubprocessError, OSError) as error:
-            results[name] = "pending: " + str(error)
+    results = wait_for_hosts({name: {"policy_version": policy["version"]}
+                             for name in HOSTS if name not in policy["revoked_names"]})
     write(ADMIN / "policy-delivery.json", json.dumps(results))
     return results
 
@@ -259,14 +280,8 @@ def renew(name):
     info = certificate_info(bundle["node.crt"])
     result = {"name": name, "expires": info["details"]["notAfter"], "delivery": "client refresh (within 60 seconds while connected, or tknet up)"}
     if name in HOSTS:
-        command = [*SYSTEM_PYTHON, "/opt/tknet/lib/tknet.py", "accept-renewal"]
-        if name != "tkserver":
-            command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", name, *command]
-        try:
-            run(command, input=json.dumps(bundle), timeout=20)
-            result["delivery"] = "installed"
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            result["delivery"] = "pending: " + str(error) + "; run tknet up on this host"
+        delivery = wait_for_hosts({name: {"certificate_fingerprint": info["fingerprint"]}})[name]
+        result["delivery"] = "installed" if delivery == "applied" else delivery
     return result
 
 

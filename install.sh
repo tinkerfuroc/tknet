@@ -2,7 +2,7 @@
 set -eu
 
 main() {
-    version=v0.4.1
+    version=v0.5.0
     role=client
     if [ -f /opt/tknet/role ]; then
         role=$(cat /opt/tknet/role)
@@ -76,16 +76,21 @@ main() {
     printf '%s\n' "$role" > "$temporary_dir/role"
     sudo install -m 644 "$temporary_dir/role" /opt/tknet/role
     if sudo test -f /etc/tknet/sshd_config; then
-        sudo /usr/bin/python3 -Es /opt/tknet/lib/tknet.py install-helpers
+        sudo /usr/bin/python3 -Es /opt/tknet/lib/tknet.py install-host-sync
+        /usr/bin/python3 -Es -c 'import sys; sys.path.insert(0, "/opt/tknet/lib"); import json, tknet; from pathlib import Path; tknet.configure_ssh(json.loads((tknet.PUBLIC_STATE / "member.json").read_text()), tknet.STATE, Path.home() / ".ssh")'
     fi
     chmod 755 "$temporary_dir/tknet"
     mv -fT -- "$temporary_dir/tknet" "$install_dir/tknet"
 
     printf 'Installed tknet %s (%s) at %s\n' "$version" "$role" "$install_dir/tknet"
-    case ":$PATH:" in
-        *":$install_dir:"*) printf '%s\n' 'Run tknet up to connect. No system service is installed.' ;;
-        *) printf '%s\n' "Add $install_dir to PATH, or run $install_dir/tknet up." ;;
-    esac
+    if [ -f /opt/tknet/membership ] || [ "$role" = server ]; then
+        printf '%s\n' 'Host network: sudo systemctl start|stop|status tknet'
+    else
+        case ":$PATH:" in
+            *":$install_dir:"*) printf '%s\n' 'Run tknet up to connect. No system service is installed.' ;;
+            *) printf '%s\n' "Add $install_dir to PATH, or run $install_dir/tknet up." ;;
+        esac
+    fi
 }
 
 main "$@"
