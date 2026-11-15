@@ -2,7 +2,7 @@
 set -eu
 
 main() {
-    version=v0.2.1
+    version=v0.3.0
     nebula_version=v1.12.0
     asset="https://raw.githubusercontent.com/tinkerfuroc/tknet/$version/tknet.py"
 
@@ -56,8 +56,8 @@ main() {
 
     printf 'Installed tknet %s at %s\n' "$version" "$install_dir/tknet"
     case ":$PATH:" in
-        *":$install_dir:"*) printf '%s\n' 'Run tknet join to enter an invitation.' ;;
-        *) printf '%s\n' "Add $install_dir to PATH, or run $install_dir/tknet join." ;;
+        *":$install_dir:"*) printf '%s\n' 'Run tknet up to connect. No system service is installed.' ;;
+        *) printf '%s\n' "Add $install_dir to PATH, or run $install_dir/tknet up." ;;
     esac
 }
 

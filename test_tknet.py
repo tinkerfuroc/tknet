@@ -1,6 +1,7 @@
 """Offline checks using real Nebula and OpenSSH certificate tools."""
 
 import base64
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import subprocess
@@ -76,6 +77,41 @@ class ConfigurationTests(unittest.TestCase):
             resolved = tknet.run(["ssh", "-G", "-F", ssh / "config", "tkmain"])
             self.assertIn("hostname 10.27.0.2\n", resolved)
             self.assertIn("port 22\n", resolved)
+
+
+class ClientLifecycleTests(unittest.TestCase):
+    def test_stale_pid_is_not_signalled(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(tknet, "RUNTIME", Path(d)):
+            tknet.write(Path(d) / "state.json", json.dumps({"pid": 999999, "start": "old"}))
+            with patch("tknet.process_start", return_value="new"), patch("tknet.os.geteuid", return_value=0), patch("tknet.os.kill") as kill:
+                tknet.client_stop()
+            kill.assert_not_called()
+
+    def test_repeat_start_does_not_spawn_a_second_process(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(tknet, "RUNTIME", Path(d)):
+            with patch("tknet.client_state", return_value={"address": "10.27.0.100/24"}), patch("tknet.os.geteuid", return_value=0), patch("tknet.subprocess.Popen") as popen, patch("builtins.print"):
+                tknet.client_start({"role": "guest", "address": "10.27.0.100/24"})
+            popen.assert_not_called()
+
+    def test_failed_up_cleans_up_only_a_new_connection(self):
+        for started in (True, False):
+            with self.subTest(started=started), tempfile.TemporaryDirectory() as d, ExitStack() as stack:
+                state = Path(d)
+                tknet.write(state / "bundle.json", json.dumps({"role": "guest"}))
+                stack.enter_context(patch.object(tknet, "STATE", state))
+                privileged = stack.enter_context(patch("tknet.privileged", return_value=json.dumps({"started": started})))
+                stack.enter_context(patch("tknet.subprocess.run", return_value=subprocess.CompletedProcess([], 1)))
+                stack.enter_context(patch("tknet.time.sleep"))
+                with self.assertRaisesRegex(RuntimeError, "unreachable"):
+                    tknet.up()
+                commands = [call.args[0] for call in privileged.call_args_list]
+                self.assertEqual(commands, ["client-start", "client-stop"] if started else ["client-start"])
+
+    def test_guest_cannot_install_a_system_service(self):
+        with patch("tknet.run") as run:
+            with self.assertRaisesRegex(ValueError, "Guest clients"):
+                tknet.install_network({"role": "guest"})
+            run.assert_not_called()
 
 
 @unittest.skipUnless((tknet.BIN / "nebula-cert").exists(), "Nebula certificate tool is required")

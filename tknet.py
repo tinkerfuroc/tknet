@@ -4,20 +4,24 @@
 import argparse
 import base64
 import getpass
+import fcntl
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 BIN = Path("/opt/tknet/bin")
 CONFIG = Path("/etc/tknet")
 STATE = Path.home() / ".local/share/tknet/client"
+RUNTIME = Path("/run/tknet-client")
+CLIENT_LOG = Path("/var/log/tknet-client.log")
 NETWORK = "10.27.0.0/24"
 SERVER = "10.27.0.1"
 HOSTS = {"tkserver": SERVER, "tkmain": "10.27.0.2"}
@@ -68,13 +72,13 @@ def invitation_key(seed):
     return private_text, public_text
 
 
-def nebula_config(role, lighthouse=False):
+def nebula_config(role, lighthouse=False, config_dir=CONFIG):
     if role not in ("host", "guest"):
         raise ValueError("Invalid role")
     rules = [{"port": "any", "proto": "any", "group": g} for g in ("host", "guest")]
     return {
-        "pki": {"ca": str(CONFIG / "ca.crt"), "cert": str(CONFIG / "node.crt"),
-                "key": str(CONFIG / "node.key"), "disconnect_invalid": True},
+        "pki": {"ca": str(config_dir / "ca.crt"), "cert": str(config_dir / "node.crt"),
+                "key": str(config_dir / "node.key"), "disconnect_invalid": True},
         "static_host_map": {} if lighthouse else {SERVER: ["166.111.192.92:3478"]},
         "lighthouse": {"am_lighthouse": lighthouse, "hosts": [] if lighthouse else [SERVER],
                        "local_allow_list": {"interfaces": {"Meta": False, "docker.*": False,
@@ -111,26 +115,162 @@ WantedBy=multi-user.target
 """
 
 
-def install_network(bundle):
+def write_network_config(bundle, directory):
     if os.geteuid():
         raise RuntimeError("Network installation requires root")
     if str(ipaddress.IPv4Interface(bundle["address"]).network) != NETWORK:
         raise ValueError("Unexpected mesh subnet")
-    config = nebula_config(bundle["role"], bundle["name"] == "tkserver")
+    config = nebula_config(bundle["role"], bundle["name"] == "tkserver", directory)
     for name in ("ca.crt", "node.crt", "node.key"):
-        write(CONFIG / name, bundle[name])
-    write(CONFIG / "nebula.json", json.dumps(config, indent=2) + "\n")
-    run([BIN / "nebula", "-test", "-config", CONFIG / "nebula.json"])
+        write(directory / name, bundle[name])
+    write(directory / "nebula.json", json.dumps(config, indent=2) + "\n")
+    run([BIN / "nebula", "-test", "-config", directory / "nebula.json"])
+
+
+def check_route_rules():
     for rule in json.loads(run(["ip", "-j", "-4", "rule"])):
         priority = rule.get("priority")
         if priority == 8906 and (rule.get("fwmark") != "0x270000" or rule.get("table") != "main"):
             raise RuntimeError("Policy rule 8906 is occupied")
         if priority == 8907 and (rule.get("dst") != NETWORK or rule.get("table") != "main"):
             raise RuntimeError("Policy rule 8907 is occupied")
+
+
+def install_network(bundle):
+    """Install persistent networking for hosts only."""
+    if bundle["role"] != "host":
+        raise ValueError("Guest clients use up, not a system service")
+    write_network_config(bundle, CONFIG)
+    check_route_rules()
     write("/etc/systemd/system/tknet.service", service_unit(), 0o644)
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "tknet.service"])
     run(["systemctl", "restart", "tknet.service"])
+
+
+def process_start(pid):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return None if fields[0] == "Z" else fields[19]
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def client_state():
+    try:
+        state = json.loads((RUNTIME / "state.json").read_text())
+        if process_start(state["pid"]) == state["start"]:
+            return state
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def client_run(bundle):
+    """Own a single on-demand Nebula process and clean up its routes on exit."""
+    if os.geteuid() or bundle["role"] != "guest":
+        raise RuntimeError("Client runtime requires root and guest membership")
+    with (RUNTIME / "runtime.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        child = None
+        stopping = False
+        added = []
+
+        def stop(signum, frame):
+            nonlocal stopping
+            stopping = True
+            if child is not None and child.poll() is None:
+                child.terminate()
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        rules = [("8906", "fwmark", "0x270000"), ("8907", "to", NETWORK)]
+        try:
+            if Path("/sys/class/net/tknet0").exists():
+                raise RuntimeError("tknet0 is already managed by another process")
+            directory = RUNTIME / "config"
+            write_network_config(bundle, directory)
+            check_route_rules()
+            existing = {r.get("priority") for r in json.loads(run(["ip", "-j", "-4", "rule"]))}
+            for priority, kind, value in rules:
+                if int(priority) not in existing:
+                    run(["ip", "-4", "rule", "add", "pref", priority, kind, value, "lookup", "main"])
+                    added.append((priority, kind, value))
+            if stopping:
+                return
+            child = subprocess.Popen([str(BIN / "nebula"), "-config", str(directory / "nebula.json")],
+                                     stdin=subprocess.DEVNULL)
+            # Publish state only after Nebula has created the interface.
+            for _ in range(100):
+                if child.poll() is not None or stopping:
+                    raise RuntimeError("Nebula exited during startup")
+                if Path("/sys/class/net/tknet0").exists():
+                    break
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("Nebula did not create tknet0")
+            write(RUNTIME / "state.json", json.dumps({"pid": os.getpid(),
+                  "start": process_start(os.getpid()), "address": bundle["address"]}), 0o644)
+            child.wait()
+        finally:
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            for priority, kind, value in reversed(added):
+                subprocess.run(["ip", "-4", "rule", "del", "pref", priority,
+                                kind, value, "lookup", "main"], capture_output=True)
+            (RUNTIME / "state.json").unlink(missing_ok=True)
+            for name in ("node.key", "node.crt", "ca.crt", "nebula.json"):
+                (RUNTIME / "config" / name).unlink(missing_ok=True)
+
+
+def client_start(bundle):
+    if os.geteuid() or bundle["role"] != "guest":
+        raise RuntimeError("Client startup requires root and guest membership")
+    RUNTIME.mkdir(mode=0o755, exist_ok=True)
+    with (RUNTIME / "start.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = client_state()
+        if state:
+            if state["address"] != bundle["address"]:
+                raise RuntimeError("Another identity is connected; disconnect it first")
+            print(json.dumps({"started": False}))
+            return
+        with CLIENT_LOG.open("a") as log:
+            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "client-run"],
+                                     stdin=subprocess.PIPE, stdout=log, stderr=log,
+                                     text=True, start_new_session=True)
+            child.stdin.write(json.dumps(bundle))
+            child.stdin.close()
+        for _ in range(200):
+            state = client_state()
+            if state and state["pid"] == child.pid:
+                print(json.dumps({"started": True}))
+                return
+            if child.poll() is not None:
+                raise RuntimeError("Client startup failed: " + "\n".join(CLIENT_LOG.read_text().splitlines()[-8:]))
+            time.sleep(0.05)
+        child.terminate()
+        child.wait(timeout=10)
+        raise RuntimeError(f"Client startup timed out; inspect {CLIENT_LOG}")
+
+
+def client_stop():
+    if os.geteuid():
+        raise RuntimeError("Client shutdown requires root")
+    state = client_state()
+    if not state:
+        return
+    os.kill(state["pid"], signal.SIGTERM)
+    for _ in range(100):
+        if process_start(state["pid"]) != state["start"]:
+            return
+        time.sleep(0.1)
+    raise RuntimeError("Client shutdown timed out")
 
 
 def install_host(bundle):
@@ -254,7 +394,15 @@ def configure_ssh(bundle, state, ssh_dir):
         write(config, include + old)
 
 
-def join(value):
+def privileged(command, bundle=None):
+    ready = subprocess.run(["sudo", "-n", "true"], capture_output=True)
+    if ready.returncode:
+        subprocess.run(["sudo", "-v"], check=True)
+    return run(["sudo", "-n", sys.executable, Path(__file__).resolve(), command],
+               input=json.dumps(bundle) if bundle is not None else None)
+
+
+def up(value=None):
     if not (BIN / "nebula").is_file():
         raise RuntimeError("Run the tknet installer to install Nebula first")
     if (STATE / "bundle.json").exists() and not value:
@@ -262,50 +410,65 @@ def join(value):
     else:
         value = value or getpass.getpass("Invitation: ")
         bundle = enrollment(invitation_data(value), STATE)
-    ready = subprocess.run(["sudo", "-n", "true"], capture_output=True)
-    if ready.returncode:
-        subprocess.run(["sudo", "-v"], check=True)
-    run(["sudo", "-n", sys.executable, Path(__file__).resolve(), "install-network"], input=json.dumps(bundle))
-    for attempt in range(15):
-        ping = subprocess.run(["ping", "-n", "-c", "1", "-W", "1", SERVER], capture_output=True)
-        if ping.returncode == 0:
-            break
-        time.sleep(1)
-    else:
-        raise RuntimeError("Mesh started, but tkserver is unreachable; inspect tknet status")
-    configure_ssh(bundle, STATE, Path.home() / ".ssh")
+    started = json.loads(privileged("client-start", bundle))["started"]
+    try:
+        for attempt in range(15):
+            ping = subprocess.run(["ping", "-n", "-c", "1", "-W", "1", SERVER], capture_output=True)
+            if ping.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("tkserver is unreachable")
+        configure_ssh(bundle, STATE, Path.home() / ".ssh")
+    except BaseException:
+        if started:
+            privileged("client-stop")
+        raise
     print("Connected. Log in with: ssh tinker@tkmain")
+
+
+def down():
+    privileged("client-stop")
+    conf = Path.home() / ".ssh/tknet.conf"
+    if conf.exists():
+        write(conf, "# Disconnected; original SSH configuration remains active.\n")
+    print("Disconnected. Run tknet up to reconnect.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("join").add_argument("invitation", nargs="?")
-    commands.add_parser("leave")
-    commands.add_parser("status")
+    commands = parser.add_subparsers(dest="command", required=True,
+                                    metavar="{up,down,status,invite}")
+    commands.add_parser("up", help="Connect on demand").add_argument("invitation", nargs="?")
+    commands.add_parser("down", help="Stop this connection")
+    commands.add_parser("status", help="Show the current connection")
     invite = commands.add_parser("invite", help="Approve a guest on tkserver")
     invite.add_argument("name")
-    commands.add_parser("install-network", help=argparse.SUPPRESS)
-    commands.add_parser("install-host", help=argparse.SUPPRESS)
+    commands.add_parser("install-network")
+    commands.add_parser("install-host")
+    for command in ("client-start", "client-run", "client-stop"):
+        commands.add_parser(command)
     args = parser.parse_args()
     try:
-        if args.command == "join":
-            join(args.invitation)
+        if args.command == "up":
+            up(args.invitation)
         elif args.command == "invite":
             result = subprocess.run([sys.executable, "/opt/tknet/lib/admin.py", "invite", args.name])
             return result.returncode
         elif args.command.startswith("install-"):
             bundle = json.loads(sys.stdin.read(131072))
             (install_host if args.command == "install-host" else install_network)(bundle)
-        elif args.command == "leave":
-            run(["sudo", "systemctl", "stop", "tknet"])
-            conf = Path.home() / ".ssh/tknet.conf"
-            if conf.exists():
-                write(conf, "# Disconnected; original SSH configuration remains active.\n")
-            print("Disconnected. Run tknet join to reconnect.")
+        elif args.command == "down":
+            down()
+        elif args.command == "client-stop":
+            client_stop()
+        elif args.command in ("client-start", "client-run"):
+            bundle = json.loads(sys.stdin.read(131072))
+            (client_start if args.command == "client-start" else client_run)(bundle)
         else:
-            subprocess.run(["systemctl", "--no-pager", "status", "tknet"], check=False)
+            state = client_state()
+            print(f"Connected: {state['address']} (PID {state['pid']})" if state else "Client disconnected")
             subprocess.run(["ip", "-br", "address", "show", "tknet0"], check=False)
         return 0
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:

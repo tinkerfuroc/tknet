@@ -5,22 +5,22 @@ certificate authority is needed. Nebula connects directly over UDP when possible
 and uses tkserver as a relay when direct connectivity fails. Existing high-port
 SSH handles admission.
 
-## Install and join
+## Install and connect
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tinkerfuroc/tknet/main/install.sh | sh
-tknet join <invitation-code>
+tknet up <invitation-code>
 ssh tinker@tkmain
 ```
 
-Requires Linux with systemd, Python 3.9+, Python cryptography, OpenSSH, curl, tar,
+Requires Linux, Python 3.9+, Python cryptography, OpenSSH, curl, tar,
 iproute2, ping and sudo. On Debian/Ubuntu, the installer installs the cryptography
 package if missing. The installer supports amd64 and arm64. It installs pinned Nebula 1.12.0
 binaries under /opt/tknet/bin and the client under ~/.local/bin. Software downloads
 use GitHub HTTPS; the running mesh has no HTTPS or public-DNS dependency.
 
 The guest receives a 47-character invitation code beginning with `tk3_`.
-`tknet join` can also prompt for the code without echoing it. Each code expires after
+`tknet up` can also prompt for the code without echoing it. Each code expires after
 24 hours and is bound to the first device's public keys. Lost-response retries
 with the same keys are allowed. Permanent device private keys never leave the
 device and existing keys are reused. Server IP, port, and the existing SSH host
@@ -30,13 +30,27 @@ Earlier invitation files and tk2 encodings remain readable for compatibility.
 
 ```sh
 tknet status
-tknet leave
-tknet join
+tknet down
+tknet up
 ```
 
-Leaving keeps the identity but disables mesh SSH overrides. Rejoining reuses it.
+`up` starts the connection in the background and returns the terminal. Clients
+do not install or depend on systemd services and do not start at boot. After a
+reboot, run `tknet up`. It reuses the saved identity without another invitation.
+Repeated `up` calls reuse the running connection instead of starting duplicates.
+
+`down` stops the client, removes its temporary routing rules, and disables mesh
+SSH overrides. It preserves the identity. Hosts still use persistent services.
 The original SSH configuration is preserved and backed up before the first join.
 Friendly names are local SSH aliases; other applications can use mesh IPs.
+
+The client runtime is under `/run/tknet-client`; logs are in
+`/var/log/tknet-client.log`. Creating a virtual network interface requires root,
+so the tool requests sudo when needed. No separate service setup is needed.
+
+For clients upgrading from v0.2.x, stop and disable the old `tknet.service` once
+before the first `up`. The already-deployed wkj-pi client has been migrated.
+The v0.3 CLI uses `up` and `down` in place of `join` and `leave`.
 
 ## Admission on tkserver
 
@@ -57,6 +71,11 @@ trusts the tkserver SSH CA; no pairwise authorized_keys management is needed.
 The separate native recovery SSH configuration is preserved.
 
 ## Current acceptance and limits
+
+The v0.3.0 guest runtime was tested on wkj-pi with the legacy systemd unit
+removed: down, up, SSH to tkmain and repeated up all passed. Down removed the
+interface and owned policy rules; repeated up kept the same runtime process.
+The client does not change the persistent services running on hosts.
 
 The tkserver / tkmain / wkj-pi path has passed invitation redemption, join,
 SSH login, direct transport and forced relay tests. tkbox and tkmini are not yet
