@@ -49,7 +49,14 @@ Repeated `up` calls reuse the running connection instead of starting duplicates.
 `down` stops the client, removes its temporary routing rules, and disables mesh
 SSH overrides. It preserves the identity. Hosts still use persistent services.
 The original SSH configuration is preserved and backed up before the first join.
-Friendly names are local SSH aliases; other applications can use mesh IPs.
+Version v0.3.3 also manages a marked block in `/etc/hosts`, so browsers and
+other applications using the system resolver can use names such as
+`http://tkmain:9860/`. No DNS server is required. Guest `up` refreshes the block;
+`down` and normal runtime exit remove only that block, preserving unrelated
+entries and edits. Hosts maintain the block through their network service.
+When UFW is already active, host setup allows traffic from `10.27.0.0/24`
+on `tktun` only. This does not open physical interfaces. Services must listen
+on the mesh IP or `0.0.0.0`; names do not expose localhost-only services.
 The approved hosts are tkserver (`10.27.0.1`), tkmain (`10.27.0.2`), tkbox
 (`10.27.0.3`) and tkmini (`10.27.0.4`). Each alias selects the `tinker` user.
 After upgrading the client, run `tknet up` to refresh aliases without replacing
@@ -91,9 +98,12 @@ The client does not change the persistent services running on hosts.
 The tkserver / tkmain / wkj-pi path has passed invitation redemption, join,
 SSH login, direct transport and forced relay tests. Version v0.3.2 enrolls tkbox
 and tkmini. Both passed SSH login from wkj-pi, tkserver and tkmain, outbound SSH
-to existing hosts, and rejection of new connections to the guest. tkbox later
-became unreachable through both native and mesh SSH; its ongoing availability
-has not been accepted. tkmini remains reachable. Guest membership is currently valid for one year;
+to existing hosts, and rejection of new connections to the guest. tkbox briefly
+became unreachable through both native and mesh SSH, then recovered; the cause
+is not established. The v0.3.3 rollout verified tkbox-to-tkmini SSH in both
+directions and HTTP 200 from wkj-pi, tkbox and tkmini at `http://tkmain:9860/`.
+Guest up/down/repeated-up tests preserved unrelated hosts entries and installed
+only one managed block. Guest membership is currently valid for one year;
 automated renewal and operational revocation commands are pending. The existing
 FRP fallback remains available. UDP reachability is required even when relaying.
 

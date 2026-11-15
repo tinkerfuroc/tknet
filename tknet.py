@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -18,7 +19,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 SYSTEM_PYTHON = ["/usr/bin/python3", "-Es"]
 TUN_NAME = "tktun"
 BIN = Path("/opt/tknet/bin")
@@ -29,6 +30,7 @@ CLIENT_LOG = Path("/var/log/tknet-client.log")
 NETWORK = "10.27.0.0/24"
 SERVER = "10.27.0.1"
 HOSTS = {"tkserver": SERVER, "tkmain": "10.27.0.2", "tkbox": "10.27.0.3", "tkmini": "10.27.0.4"}
+HOSTS_FILE = Path("/etc/hosts")
 ENROLLMENT_SERVER = "166.111.192.92"
 ENROLLMENT_PORT = 12002
 ENROLLMENT_HOST_KEY = (
@@ -297,6 +299,7 @@ def client_run(bundle):
         child = None
         stopping = False
         added = []
+        names_owned = False
 
         def stop(signum, frame):
             nonlocal stopping
@@ -325,6 +328,8 @@ def client_run(bundle):
                 time.sleep(0.05)
             else:
                 raise RuntimeError(f"Nebula did not create {TUN_NAME}")
+            configure_hostnames(True)
+            names_owned = True
             write(RUNTIME / "state.json", json.dumps({"pid": os.getpid(),
                   "start": process_start(os.getpid()), "address": bundle["address"]}), 0o644)
             child.wait()
@@ -337,6 +342,8 @@ def client_run(bundle):
                     child.kill()
                     child.wait()
             routes_down(added)
+            if names_owned:
+                configure_hostnames(False)
             (RUNTIME / "state.json").unlink(missing_ok=True)
             for name in ("node.key", "node.crt", "ca.crt", "nebula.json"):
                 (RUNTIME / "config" / name).unlink(missing_ok=True)
@@ -352,6 +359,7 @@ def client_start(bundle):
         if state:
             if state["address"] != bundle["address"]:
                 raise RuntimeError("Another identity is connected; disconnect it first")
+            configure_hostnames(True)
             print(json.dumps({"started": False}))
             return
         with CLIENT_LOG.open("a") as log:
@@ -378,10 +386,12 @@ def client_stop():
         raise RuntimeError("Client shutdown requires root")
     state = client_state()
     if not state:
+        configure_hostnames(False)
         return
     os.kill(state["pid"], signal.SIGTERM)
     for _ in range(100):
         if process_start(state["pid"]) != state["start"]:
+            configure_hostnames(False)
             return
         time.sleep(0.1)
     raise RuntimeError("Client shutdown timed out")
@@ -391,6 +401,7 @@ def install_host(bundle):
     if bundle["role"] != "host":
         raise ValueError("Host setup requires the host role")
     install_network(bundle)
+    configure_host_firewall()
     for name in ("ssh-user-ca.pub", "ssh-host-cert.pub"):
         write(CONFIG / name, bundle[name], 0o644)
     address = str(ipaddress.IPv4Interface(bundle["address"]).ip)
@@ -433,6 +444,14 @@ WantedBy=tknet.service
     run(["systemctl", "reload", "ssh"])
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now", "tknet-sshd.service"])
+
+
+def configure_host_firewall():
+    """Let authenticated mesh traffic reach host services when UFW is active."""
+    ufw = shutil.which("ufw")
+    if ufw and "Status: active" in run([ufw, "status"]):
+        run([ufw, "allow", "in", "on", TUN_NAME, "from", NETWORK,
+             "comment", "TK authenticated mesh"])
 
 
 def invitation_data(value):
@@ -482,6 +501,30 @@ def enrollment(invite, state):
     bundle["node.key"] = (state / "node.key").read_text()
     write(state / "bundle.json", json.dumps(bundle))
     return bundle
+
+
+def configure_hostnames(enabled):
+    """Manage only the TK block, preserving other hosts entries and permissions."""
+    begin, end = "# BEGIN TKNET HOSTS\n", "# END TKNET HOSTS\n"
+    with HOSTS_FILE.open("r+", encoding="utf-8", newline="") as hosts:
+        fcntl.flock(hosts, fcntl.LOCK_EX)
+        old = hosts.read()
+        base = old
+        if begin in base or end in base:
+            if base.count(begin) != 1 or base.count(end) != 1:
+                raise RuntimeError("Malformed TK hosts block")
+            start, stop = base.index(begin), base.index(end)
+            if stop < start:
+                raise RuntimeError("Malformed TK hosts block")
+            base = base[:start] + base[stop + len(end):]
+        block = begin + "".join(f"{address}\t{name}\n" for name, address in HOSTS.items()) + end
+        updated = block + base if enabled else base
+        if updated != old:
+            hosts.seek(0)
+            hosts.write(updated)
+            hosts.truncate()
+            hosts.flush()
+            os.fsync(hosts.fileno())
 
 
 def configure_ssh(bundle, state, ssh_dir):
@@ -562,7 +605,7 @@ def main():
     invite.add_argument("name")
     commands.add_parser("install-network")
     commands.add_parser("install-host")
-    for command in ("client-start", "client-run", "client-stop", "routes-up", "routes-down"):
+    for command in ("client-start", "client-run", "client-stop", "routes-up", "routes-down", "names-up"):
         commands.add_parser(command)
     args = parser.parse_args()
     try:
@@ -580,6 +623,9 @@ def main():
             client_stop()
         elif args.command in ("routes-up", "routes-down"):
             (routes_up if args.command == "routes-up" else routes_down)()
+            configure_hostnames(args.command == "routes-up")
+        elif args.command == "names-up":
+            configure_hostnames(True)
         elif args.command in ("client-start", "client-run"):
             bundle = json.loads(sys.stdin.read(131072))
             (client_start if args.command == "client-start" else client_run)(bundle)

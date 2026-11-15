@@ -93,6 +93,15 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class ClientLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        hosts = Path(temporary.name) / "hosts"
+        hosts.write_text("127.0.0.1 localhost\n")
+        replacement = patch.object(tknet, "HOSTS_FILE", hosts)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+
     def test_stale_pid_is_not_signalled(self):
         with tempfile.TemporaryDirectory() as d, patch.object(tknet, "RUNTIME", Path(d)):
             tknet.write(Path(d) / "state.json", json.dumps({"pid": 999999, "start": "old"}))
@@ -125,6 +134,47 @@ class ClientLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Guest clients"):
                 tknet.install_network({"role": "guest"})
             run.assert_not_called()
+
+
+class HostnameTests(unittest.TestCase):
+    def test_firewall_rule_is_scoped_to_the_mesh(self):
+        with patch("tknet.shutil.which", return_value="/usr/sbin/ufw"), patch("tknet.run", return_value="Status: active\n") as run:
+            tknet.configure_host_firewall()
+            self.assertEqual(run.call_args.args[0], ["/usr/sbin/ufw", "allow", "in", "on", "tktun",
+                             "from", "10.27.0.0/24", "comment", "TK authenticated mesh"])
+        with patch("tknet.shutil.which", return_value="/usr/sbin/ufw"), patch("tknet.run", return_value="Status: inactive\n") as run:
+            tknet.configure_host_firewall()
+            self.assertEqual(run.call_count, 1)
+
+    def test_refresh_and_disconnect_preserve_other_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hosts = Path(directory) / "hosts"
+            original = "127.0.0.1 localhost\n::1 localhost\n192.0.2.1 custom # keep\n"
+            hosts.write_text(original)
+            hosts.chmod(0o644)
+            with patch.object(tknet, "HOSTS_FILE", hosts):
+                tknet.configure_hostnames(True)
+                tknet.configure_hostnames(True)
+                self.assertEqual(hosts.read_text().count("# BEGIN TKNET HOSTS"), 1)
+                for name, address in tknet.HOSTS.items():
+                    self.assertIn(f"{address}\t{name}\n", hosts.read_text())
+                # Preserve an unrelated edit made while the connection is active.
+                with hosts.open("a") as stream:
+                    stream.write("192.0.2.2 added\n")
+                tknet.configure_hostnames(False)
+                tknet.configure_hostnames(False)
+                self.assertEqual(hosts.read_text(), original + "192.0.2.2 added\n")
+                self.assertEqual(hosts.stat().st_mode & 0o777, 0o644)
+
+    def test_malformed_block_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hosts = Path(directory) / "hosts"
+            original = "127.0.0.1 localhost\n# BEGIN TKNET HOSTS\n"
+            hosts.write_text(original)
+            with patch.object(tknet, "HOSTS_FILE", hosts):
+                with self.assertRaisesRegex(RuntimeError, "Malformed"):
+                    tknet.configure_hostnames(True)
+            self.assertEqual(hosts.read_text(), original)
 
 
 class RouteTests(unittest.TestCase):
