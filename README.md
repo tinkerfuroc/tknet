@@ -104,8 +104,10 @@ is not established. The v0.3.3 rollout verified tkbox-to-tkmini SSH in both
 directions and HTTP 200 from wkj-pi, tkbox and tkmini at `http://tkmain:9860/`.
 Guest up/down/repeated-up tests preserved unrelated hosts entries and installed
 only one managed block. Guest membership is currently valid for one year;
-automated renewal and operational revocation commands are pending. The existing
-FRP fallback remains available. UDP reachability is required even when relaying.
+automated renewal and operational revocation commands are pending. FRP was
+retired on 2026-11-15: server and client services are stopped and disabled.
+Native direct SSH remains available through the local `*-ssh` aliases.
+UDP reachability is required even when relaying.
 
 The invitation-code flow was separately verified against tkserver with an isolated
 temporary identity: redemption, signed SSH login to tkmain, same-key retry, and
